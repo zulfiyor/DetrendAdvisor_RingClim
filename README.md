@@ -1,0 +1,1 @@
+# DetrendAdvisor_RingClim
