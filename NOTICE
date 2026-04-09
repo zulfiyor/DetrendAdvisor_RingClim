@@ -1,0 +1,11 @@
+DetrendAdvisor_RingClim
+Copyright (c) 2026 Dr Zulfiyor Bakhtiyorov
+
+This repository is distributed under the MIT License. See LICENSE.
+
+This software suite contains two connected but independently runnable desktop applications:
+- detrend_advisor.py (primary detrending/advisory app)
+- ringclim.py (companion climate-analysis app)
+
+Scholarly citation is strongly encouraged for reuse, adaptation, redistribution, and derivative research work.
+See CITATION.cff and CITATION_POLICY.md.

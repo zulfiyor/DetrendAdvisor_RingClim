@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software suite, please cite the associated article and the software repository."
+title: "DetrendAdvisor + RingClim Suite"
+authors:
+  - family-names: "Bakhtiyorov"
+    given-names: "Zulfiyor"
+license: "MIT"
+abstract: "Connected desktop suite for dendrochronological detrending advice, chronology export, and tree-ring climate correlation analysis."
+keywords:
+  - dendrochronology
+  - tree rings
+  - detrending
+  - climate correlation
+  - desktop application
+repository-code: "TODO: repository URL"
+preferred-citation:
+  type: article
+  title: "TODO: article title"
+  journal: "TODO: journal"
+  year: "TODO: year"
+  authors:
+    - name: "TODO: author list"
+  note: "TODO: DOI"
