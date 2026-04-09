@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a new capability for Detrend Advisor, RingClim, or the connected suite workflow.
+title: "feature: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: app_scope
+    attributes:
+      label: Target application/workflow
+      options:
+        - detrend_advisor.py
+        - ringclim.py
+        - Connected Detrend Advisor -> RingClim workflow
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      placeholder: What user problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
