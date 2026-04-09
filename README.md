@@ -91,12 +91,27 @@ Run Detrend Advisor first, perform detrending/export, then use its RingClim laun
 - **R / Rscript + dplR**: external runtime dependency for dplR-oriented workflows in `detrend_advisor.py`.
 - Some dependencies are feature-specific; see [docs/RUNTIME_DEPENDENCIES.md](docs/RUNTIME_DEPENDENCIES.md).
 
-## Packaged builds (end users)
-If you use packaged desktop builds instead of source execution, follow release notes for that artifact.
+## Downloads / Packaged builds (end users)
+Source code and development files are provided in this GitHub repository.
 
-- Release/download location: **TODO: add official release location**
-- Packaged builds may include a subset/scope of workflows per platform and release.
-- External runtime dependencies (for example R/dplR) must be documented per release if required.
+Ready-made packaged desktop builds are provided in this external download folder:
+
+https://drive.google.com/drive/folders/1fQLibCdZHOb9q1mPqpIHZJV1EWFfFGJ3?usp=drive_link
+
+The external download folder contains separate packaged-build directories for:
+- Windows
+- macOS
+
+End-user quick steps:
+1. Open the external download folder.
+2. Choose the Windows or macOS packaged-build directory.
+3. Download the packaged build archive.
+4. Extract it to any convenient location.
+5. Run it directly from that convenient location after extraction.
+
+Important reliability recommendation:
+- It is **very strongly recommended** that R and dplR are already installed on the target computer.
+- Do not assume R/dplR are bundled unless a specific release explicitly verifies and states that.
 
 ## Citation
 This repository is intended to be cited as a connected software suite covering both Detrend Advisor and RingClim.

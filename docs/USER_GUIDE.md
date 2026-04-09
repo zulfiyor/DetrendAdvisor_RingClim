@@ -1,5 +1,17 @@
 # User Guide
 
+## End-user quick start (packaged builds)
+1. Open the external packaged-build download folder:  
+   https://drive.google.com/drive/folders/1fQLibCdZHOb9q1mPqpIHZJV1EWFfFGJ3?usp=drive_link
+2. Choose the folder for your platform (Windows or macOS).
+3. Download the packaged build archive.
+4. Extract it to any convenient location.
+5. Run it directly from that convenient location after extraction.
+
+Very important recommendation:
+- It is **very strongly recommended** that R and dplR are already installed on your computer.
+- Do not assume R/dplR are bundled in packaged builds unless a release explicitly states that they are bundled.
+
 ## Quick start: Detrend Advisor
 1. Run `python detrend_advisor.py`.
 2. Import ring-width-like input (CSV/Tucson text/TXT/JSON/Excel).
