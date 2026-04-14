@@ -9,10 +9,19 @@ Features:
     * JSON (long or wide),
     * Excel (.xls, .xlsx).
 - Optionally load climate/target CSV.
+- Work with multi-dataset projects: create, open, save, save as, merge, replace, and append datasets.
 - Choose goal: highfreq / mixed / lowfreq / temp_recon / runoff_recon / drought_recon / variance_check.
-- Run diagnostics and detrending advisor (exp, spline, RCS, signal-free RCS).
-- Show recommendation and plots in the window.
-- Export chronologies and a markdown report from the GUI.
+- Run diagnostics and detrending advisor with dplR-backed methods, including exp, linear, mean,
+  running mean, Hugershoff, LOWESS, spline, age-dependent spline, AR, RCS, signal-free RCS,
+  and signal-free spline/age-dependent spline variants.
+- Support optional POWT preprocessing and side-by-side POWT / no-POWT result handling.
+- Group cores into trees automatically or manually with editable Series ID parsing rules.
+- Show recommendation, runtime log, chronologies, RWI, EPS/Rbar diagnostics, signal diagnostics,
+  POWT preview/results, compare views, and guide text in the GUI.
+- Export chronologies, RWI matrices, reports, and Excel / CSV outputs from the GUI.
+- Launch RingClim and prefill it with detrended outputs from the current project.
+- Detect R / Rscript / dplR automatically, allow manual Rscript selection, and support optional
+  online installation attempts on supported systems.
 Inside code:
 - All comments and docstrings are in English only.
 """
@@ -205,6 +214,8 @@ def _default_compat_config() -> DplrCompatConfig:
 
 DEFAULT_COMPAT_CONFIG = _default_compat_config()
 
+_MANUAL_RSCRIPT_PATH_CACHE: str = ""
+
 def _rscript_available(rscript: str) -> bool:
     try:
         return shutil.which(rscript) is not None
@@ -318,6 +329,132 @@ def _resolve_rscript_path(rscript: str = "Rscript") -> Optional[str]:
     except Exception:
         return None
 
+
+def _validate_rscript_file(path: str) -> Optional[str]:
+    """Validate one manually selected Rscript path."""
+    try:
+        cand = os.path.abspath(str(path or "").strip())
+    except Exception:
+        return None
+    if not cand:
+        return None
+    if not os.path.isfile(cand):
+        return None
+    name = os.path.basename(cand).lower()
+    if name not in ("rscript", "rscript.exe"):
+        return None
+    return cand
+
+
+def _ask_user_for_rscript_path(parent: Optional[tk.Misc] = None) -> Optional[str]:
+    """Ask the user to select the Rscript executable manually."""
+    global _MANUAL_RSCRIPT_PATH_CACHE
+
+    initial_path = _validate_rscript_file(_MANUAL_RSCRIPT_PATH_CACHE)
+    initial_dir = ""
+    if initial_path:
+        initial_dir = os.path.dirname(initial_path)
+    else:
+        resolved = _resolve_rscript_path("Rscript")
+        if resolved:
+            initial_dir = os.path.dirname(str(resolved))
+
+    filetypes = [
+        ("Rscript executable", "Rscript.exe" if os.name == "nt" else "Rscript"),
+        ("All files", "*.*" if os.name == "nt" else "*"),
+    ]
+    selected = filedialog.askopenfilename(
+        parent=parent,
+        title="Select Rscript executable",
+        initialdir=initial_dir or None,
+        filetypes=filetypes,
+    )
+    valid = _validate_rscript_file(selected)
+    if valid:
+        _MANUAL_RSCRIPT_PATH_CACHE = str(valid)
+        return str(valid)
+    return None
+
+
+def _iter_known_rscript_candidates(rscript: str = "Rscript") -> list[str]:
+    """Return unique existing Rscript candidates in priority order."""
+    cands: list[str] = []
+
+    def _add(path: Optional[str]) -> None:
+        if not path:
+            return
+        try:
+            norm = os.path.abspath(str(path))
+        except Exception:
+            return
+        if not os.path.isfile(norm):
+            return
+        if norm not in cands:
+            cands.append(norm)
+
+    _add(_validate_rscript_file(_MANUAL_RSCRIPT_PATH_CACHE))
+    _add(_resolve_rscript_path(rscript))
+
+    try:
+        probe = subprocess.run(
+            ["where" if os.name == "nt" else "which", "Rscript"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in str(probe.stdout or "").splitlines():
+            _add(line.strip())
+    except Exception:
+        pass
+
+    for cand in _candidate_rscript_paths(rscript):
+        _add(cand)
+
+    if os.name == "nt":
+        for env_key in ("LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+            base = os.getenv(env_key, "").strip()
+            if not base:
+                continue
+            for sub in (
+                os.path.join("Programs", "R", "R-*", "bin", "Rscript.exe"),
+                os.path.join("Programs", "R", "R-*", "bin", "x64", "Rscript.exe"),
+                os.path.join("R", "R-*", "bin", "Rscript.exe"),
+                os.path.join("R", "R-*", "bin", "x64", "Rscript.exe"),
+            ):
+                try:
+                    from pathlib import Path as _Path
+                    for p in _Path(base).glob(sub):
+                        _add(str(p))
+                except Exception:
+                    pass
+
+    return cands
+
+
+def _r_package_available_with_rscript(rscript_cmd: str, package_name: str) -> bool:
+    """Return True when a specific Rscript can load one package."""
+    try:
+        cmd = [
+            str(rscript_cmd),
+            "-e",
+            (
+                "quit(save='no', status="
+                f"if (requireNamespace('{str(package_name)}', quietly=TRUE)) 0 else 11)"
+            ),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return int(proc.returncode) == 0
+    except Exception:
+        return False
+
+
+def _find_rscript_with_package(config: DplrCompatConfig, package_name: str) -> Optional[str]:
+    """Find an installed Rscript that can load the requested R package."""
+    for rscript_cmd in _iter_known_rscript_candidates(config.rscript):
+        if _r_package_available_with_rscript(rscript_cmd, package_name):
+            return str(rscript_cmd)
+    return None
+
 def _try_install_r_windows_online() -> tuple[bool, str]:
     """Attempt to install R on Windows using online package managers.
 
@@ -351,6 +488,12 @@ def _try_install_r_windows_online() -> tuple[bool, str]:
             logs.append(out)
             if proc.returncode == 0:
                 return True, "\n\n".join(logs)
+            out_lc = out.lower()
+            if (
+                "found an existing package already installed" in out_lc
+                or "no available upgrade found" in out_lc
+            ):
+                return True, "\n\n".join(logs)
 
         if shutil.which("choco"):
             cmd = ["choco", "install", "r.project", "-y"]
@@ -382,6 +525,11 @@ def _ensure_rscript(config: DplrCompatConfig) -> str:
         config.rscript = resolved
         return resolved
 
+    manual_cached = _validate_rscript_file(_MANUAL_RSCRIPT_PATH_CACHE)
+    if manual_cached:
+        config.rscript = str(manual_cached)
+        return str(manual_cached)
+
     if config.auto_install_r and os.name == "nt":
         ok, _install_log = _try_install_r_windows_online()
         if ok:
@@ -401,16 +549,13 @@ def _ensure_rscript(config: DplrCompatConfig) -> str:
 def _dplr_package_available(config: DplrCompatConfig) -> bool:
     """Return True if the installed R runtime can load dplR."""
     try:
-        rscript_cmd = _resolve_rscript_path(config.rscript)
-        if not rscript_cmd:
-            return False
-        cmd = [
-            rscript_cmd,
-            "-e",
-            "quit(save='no', status=if (requireNamespace('dplR', quietly=TRUE)) 0 else 11)",
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        return int(proc.returncode) == 0
+        rscript_cmd = _find_rscript_with_package(config, "dplR")
+        if rscript_cmd:
+            config.rscript = str(rscript_cmd)
+            global _MANUAL_RSCRIPT_PATH_CACHE
+            _MANUAL_RSCRIPT_PATH_CACHE = str(rscript_cmd)
+            return True
+        return False
     except Exception:
         return False
 
@@ -3145,6 +3290,22 @@ def _default_series_group_patterns_text() -> str:
     return "\n".join(DEFAULT_SERIES_GROUP_PATTERN_LINES)
 
 
+def _parse_manual_tree_prefixes(text: str) -> list[str]:
+    """Parse user-defined tree/site prefixes from a comma- or line-separated text block."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        for token in re.split(r"[,;]+", str(raw_line or "")):
+            key = _normalize_series_id_token(token)
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 def _parse_radius_suffix_variants(text: str) -> list[str]:
     """Parse editable radius/core suffix variants from a multi-line text block."""
     out: list[str] = []
@@ -3197,48 +3358,67 @@ def _split_series_id_by_group_pattern(
 
     Notes:
         - The normalized Series ID is used, so spaces and separators are ignored.
-        - A positions must be alphabetic.
-        - B positions must be numeric.
+        - The pattern is matched against the rightmost part of the Series ID.
+        - Any unmatched leading prefix is treated as a site/locality prefix and
+          is ignored for tree grouping.
+        - A/B accept both conventions:
+          * A = letters, B = digits
+          * A = digits, B = letters
         - C positions must be trailing alphanumeric suffix characters.
         - All A/B positions are merged into the tree label.
         - All trailing C positions are merged into the core/radius label.
     """
     sid = _normalize_series_id_token(series_id)
     pat = re.sub(r"[^ABC]", "", str(pattern or "").upper())
-    if not sid or not pat or len(sid) != len(pat):
+    if not sid or not pat or len(sid) < len(pat):
         return None
     if "C" not in pat:
         return None
 
     first_c = pat.find("C")
-    if first_c < 0 or ("C" in pat[:first_c]):
+    if first_c < 0:
         return None
     if any(ch == "A" for ch in pat[first_c:]) or any(ch == "B" for ch in pat[first_c:]):
         return None
 
-    tree_chars: list[str] = []
-    core_chars: list[str] = []
-    for ch, token in zip(sid, pat):
-        if token == "A":
-            if not ch.isalpha():
-                return None
-            tree_chars.append(ch)
-        elif token == "B":
-            if not ch.isdigit():
-                return None
-            tree_chars.append(ch)
-        elif token == "C":
-            if not ch.isalnum():
-                return None
-            core_chars.append(ch)
-        else:
-            return None
+    sid_tail = sid[-len(pat):]
 
-    tree_label = "".join(tree_chars).strip()
-    core_label = "".join(core_chars).strip()
-    if not tree_label or not core_label:
-        return None
-    return (tree_label, core_label)
+    def _try_match(a_is_alpha: bool) -> Optional[tuple[str, str]]:
+        tree_chars: list[str] = []
+        core_chars: list[str] = []
+        for ch, token in zip(sid_tail, pat):
+            if token == "A":
+                if a_is_alpha:
+                    if not ch.isalpha():
+                        return None
+                else:
+                    if not ch.isdigit():
+                        return None
+                tree_chars.append(ch)
+            elif token == "B":
+                if a_is_alpha:
+                    if not ch.isdigit():
+                        return None
+                else:
+                    if not ch.isalpha():
+                        return None
+                tree_chars.append(ch)
+            elif token == "C":
+                if not ch.isalnum():
+                    return None
+                core_chars.append(ch)
+            else:
+                return None
+        tree_label = "".join(tree_chars).strip()
+        core_label = "".join(core_chars).strip()
+        if not tree_label or not core_label:
+            return None
+        return (tree_label, core_label)
+
+    res = _try_match(a_is_alpha=True)
+    if res is not None:
+        return res
+    return _try_match(a_is_alpha=False)
 
 
 def _build_radius_suffix_guess_patterns(
@@ -3319,36 +3499,290 @@ def _build_radius_suffix_guess_patterns(
 def _normalize_series_id_token(text: str) -> str:
     """Normalize one series identifier token for grouping heuristics."""
     raw = str(text or "").strip().upper()
-    raw = re.sub(r"[\s\-_./]+", "", raw)
+    raw = re.sub(r"[\s\-_./\\,:;|+(){}\[\]<>]+", "", raw)
     return raw
 
 
+def _common_series_site_prefix(series_names: list[str]) -> str:
+    """Return a shared site/locality prefix that should be ignored for tree grouping."""
+    vals = [
+        _normalize_series_id_token(x)
+        for x in [str(v) for v in list(series_names)]
+        if str(x).strip()
+    ]
+    if len(vals) < 2:
+        return ""
+    prefix = os.path.commonprefix(vals)
+    if not prefix:
+        return ""
+    prefix = re.sub(r"\d+$", "", str(prefix))
+    if not prefix:
+        return ""
+    if len(prefix) >= min(len(v) for v in vals):
+        return ""
+    return str(prefix)
+
+
+def _choose_common_site_prefix(
+    series_names: list[str],
+    manual_prefixes: Optional[list[str]] = None,
+) -> str:
+    """Choose a site/locality prefix, preferring user-defined prefixes when possible."""
+    vals = [
+        _normalize_series_id_token(x)
+        for x in [str(v) for v in list(series_names)]
+        if str(x).strip()
+    ]
+    if vals and manual_prefixes:
+        manual_norm = [
+            _normalize_series_id_token(x)
+            for x in list(manual_prefixes)
+            if _normalize_series_id_token(x)
+        ]
+        manual_norm.sort(key=len, reverse=True)
+        for pref in manual_norm:
+            if len(pref) >= min(len(v) for v in vals):
+                continue
+            if any(v.startswith(pref) for v in vals):
+                return str(pref)
+    return _common_series_site_prefix(series_names)
+
+
+def _choose_series_site_prefix(
+    series_id: str,
+    all_series_names: list[str],
+    manual_prefixes: Optional[list[str]] = None,
+) -> str:
+    """Choose the effective site/locality prefix for one series only.
+
+    Notes:
+        - Manual prefixes must never be applied globally to unrelated series.
+        - This keeps prefix-free numeric series stable when the dataset also
+          contains a few coded series with a site prefix.
+        - A manual prefix is used only when the current normalized series id
+          actually starts with that prefix.
+    """
+    sid = _normalize_series_id_token(series_id)
+    manual_norm = [
+        _normalize_series_id_token(x)
+        for x in list(manual_prefixes or [])
+        if _normalize_series_id_token(x)
+    ]
+    manual_norm.sort(key=len, reverse=True)
+    for pref in manual_norm:
+        if sid.startswith(pref):
+            return str(pref)
+
+    common_prefix = _common_series_site_prefix(all_series_names)
+    if common_prefix and sid.startswith(common_prefix):
+        return str(common_prefix)
+    return ""
+
+
+def _merge_series_prefix_parts(common_site_prefix: str, tree_prefix: str) -> str:
+    """Merge a shared site prefix with a parsed tree prefix without duplicating overlap."""
+    left = _normalize_series_id_token(common_site_prefix)
+    right = _normalize_series_id_token(tree_prefix)
+    if not left:
+        return str(right)
+    if not right:
+        return str(left)
+    if right.startswith(left):
+        return str(right)
+    if left.endswith(right):
+        return str(left)
+    max_overlap = min(len(left), len(right))
+    for size in range(max_overlap, 0, -1):
+        if left[-size:] == right[:size]:
+            return str(left + right[size:])
+    return str(left + right)
+
+
 def _split_series_id_prefix_number_suffix(series_id: str) -> tuple[str, str, str]:
-    """Split a normalized Series ID into prefix letters, first tree number, and trailing suffix."""
+    """Split a normalized Series ID into tree prefix, tree number, and trailing core suffix.
+
+    Notes:
+        - Matching is intentionally right-to-left.
+        - Generic automatic parsing must not treat plain trailing digits as a core/radius suffix,
+          because identifiers such as KC0221 and KC0224 are usually different tree numbers.
+        - Numeric-only suffixes should be handled by explicit suffix rules such as 1/2 or 01/02.
+        - Separators are ignored earlier by _normalize_series_id_token(), including spaces,
+          hyphens, underscores, dots, slashes, backslashes, commas, semicolons, colons, pipes,
+          plus signs, parentheses, brackets, braces, and angle brackets.
+    """
     sid = _normalize_series_id_token(series_id)
     if not sid:
         return ("", "", "")
 
-    prefix_match = re.match(r"^[A-Z]+", sid)
-    tree_prefix = prefix_match.group(0) if prefix_match else ""
+    m = re.match(r"^(.*?)(\d+)(R\d{1,2})$", sid)
+    if m is not None:
+        return (
+            str(m.group(1) or ""),
+            str(m.group(2) or ""),
+            str(m.group(3) or ""),
+        )
 
-    rest = sid[len(tree_prefix):]
-    number_match = re.match(r"^\d+", rest)
-    tree_number_text = number_match.group(0) if number_match else ""
+    m = re.match(r"^(.*?)(\d+)([NSEW]{1,2})$", sid)
+    if m is not None:
+        return (
+            str(m.group(1) or ""),
+            str(m.group(2) or ""),
+            str(m.group(3) or ""),
+        )
 
-    suffix = rest[len(tree_number_text):] if tree_number_text else rest
-    return (str(tree_prefix), str(tree_number_text), str(suffix))
+    m = re.match(r"^(.*?)(\d+)([A-Z])$", sid)
+    if m is not None:
+        return (
+            str(m.group(1) or ""),
+            str(m.group(2) or ""),
+            str(m.group(3) or ""),
+        )
+
+    m = re.match(r"^(.*?)(\d+)$", sid)
+    if m is not None:
+        return (
+            str(m.group(1) or ""),
+            str(m.group(2) or ""),
+            "",
+        )
+
+    prefix_match = re.match(r"^[A-Z0-9]+", sid)
+    tree_prefix = prefix_match.group(0) if prefix_match else sid
+    return (str(tree_prefix), "", "")
+
+
+def _series_active_year_span(series: pd.Series) -> tuple[Optional[int], Optional[int]]:
+    """Return the active non-missing year span for one series."""
+    try:
+        s = pd.to_numeric(series, errors="coerce")
+    except Exception:
+        return (None, None)
+    s = s.dropna()
+    if s.empty:
+        return (None, None)
+    try:
+        years = pd.Index(s.index).astype(int)
+    except Exception:
+        years = pd.to_numeric(pd.Index(s.index), errors="coerce")
+        years = years[~pd.isna(years)].astype(int)
+    if len(years) == 0:
+        return (None, None)
+    return (int(np.min(years)), int(np.max(years)))
+
+
+def _year_spans_overlap(
+    span_a: tuple[Optional[int], Optional[int]],
+    span_b: tuple[Optional[int], Optional[int]],
+) -> bool:
+    """Return True when two year spans overlap by at least one year."""
+    a0, a1 = span_a
+    b0, b1 = span_b
+    if a0 is None or a1 is None or b0 is None or b1 is None:
+        return True
+    return max(int(a0), int(b0)) <= min(int(a1), int(b1))
+
+
+def _apply_nonoverlap_split_guard(
+    ids_df: pd.DataFrame,
+    rwl: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Prevent merging same-labeled series when their active periods do not overlap.
+
+    Notes:
+        - Some datasets intentionally split one logical code into separate temporal segments.
+        - When two rows have the same auto tree label but no year overlap, they must stay separate.
+        - This guard rewrites tree labels only for conflicting non-overlapping subsets.
+    """
+    if ids_df is None or ids_df.empty:
+        return ids_df
+    if rwl is None or not isinstance(rwl, pd.DataFrame) or rwl.empty:
+        return ids_df
+    if "series_id" not in ids_df.columns or "tree_label" not in ids_df.columns:
+        return ids_df
+
+    out = ids_df.copy()
+    if out.index.name != "series_id" and "series_id" in out.columns:
+        out = out.set_index("series_id", drop=False)
+
+    rwl2 = rwl.copy()
+    rwl2.columns = [str(x) for x in list(rwl2.columns)]
+
+    for tree_label, idx_labels in out.groupby("tree_label", sort=False).groups.items():
+        members = [str(x) for x in list(idx_labels)]
+        if len(members) <= 1:
+            continue
+
+        spans: dict[str, tuple[Optional[int], Optional[int]]] = {}
+        for series_id in members:
+            if series_id in rwl2.columns:
+                spans[series_id] = _series_active_year_span(rwl2[series_id])
+            else:
+                spans[series_id] = (None, None)
+
+        clusters: list[list[str]] = []
+        for series_id in members:
+            placed = False
+            for cluster in clusters:
+                if all(_year_spans_overlap(spans[series_id], spans[other]) for other in cluster):
+                    cluster.append(series_id)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([series_id])
+
+        if len(clusters) <= 1:
+            continue
+
+        for cluster_idx, cluster in enumerate(clusters, start=1):
+            if cluster_idx == 1:
+                new_tree_label = str(tree_label)
+            else:
+                new_tree_label = f"{tree_label}__SPLIT{cluster_idx}"
+            for series_id in cluster:
+                out.loc[series_id, "tree_label"] = str(new_tree_label)
+
+    return out
 
 
 def _guess_tree_core_labels_from_series_id(
     series_id: str,
     suffix_variant_lines: Optional[list[str]] = None,
     group_pattern_lines: Optional[list[str]] = None,
+    common_site_prefix: str = "",
 ) -> tuple[str, str, float]:
-    """Guess tree/core labels from one series identifier."""
-    sid = _normalize_series_id_token(series_id)
-    if not sid:
+    """Guess tree/core labels from one series identifier.
+
+    Notes:
+        - Generic parsing is intentionally conservative for numeric endings.
+        - Examples such as KC02 24 and KC0221 are normalized first and then parsed from the end,
+          so the numeric ending is treated as part of the tree number unless an explicit suffix
+          rule or grouping pattern says otherwise.
+    """
+    sid_full = _normalize_series_id_token(series_id)
+    if not sid_full:
         return ("SERIES", "1", 0.0)
+
+    sid = sid_full
+    site_prefix = _normalize_series_id_token(common_site_prefix)
+    if site_prefix and sid.startswith(site_prefix) and len(sid) > len(site_prefix):
+        sid = sid[len(site_prefix):]
+
+    for sid_candidate in (sid, sid_full):
+        tree_prefix, tree_number_text, trailing_suffix = _split_series_id_prefix_number_suffix(sid_candidate)
+        if tree_prefix and tree_number_text and trailing_suffix:
+            tree_label = f"{tree_prefix}{tree_number_text}".strip()
+            core_label = trailing_suffix.strip()
+            if tree_label and core_label:
+                return (tree_label, core_label, 0.995)
+
+    for sid_candidate in (sid, sid_full):
+        for pattern in list(group_pattern_lines or []):
+            split_res = _split_series_id_by_group_pattern(sid_candidate, pattern)
+            if split_res is None:
+                continue
+            tree_label, core_label = split_res
+            if len(tree_label) >= 1 and core_label:
+                return (tree_label, core_label, 0.99)
 
     tree_prefix, tree_number_text, trailing_suffix = _split_series_id_prefix_number_suffix(sid)
     if tree_number_text:
@@ -3366,14 +3800,6 @@ def _guess_tree_core_labels_from_series_id(
         core_label = str(m.group(2) or "").strip()
         if len(tree_label) >= 2 and core_label:
             return (tree_label, core_label, float(confidence))
-
-    for pattern in list(group_pattern_lines or []):
-        split_res = _split_series_id_by_group_pattern(sid, pattern)
-        if split_res is None:
-            continue
-        tree_label, core_label = split_res
-        if len(tree_label) >= 1 and core_label:
-            return (tree_label, core_label, 0.97)
 
     return (sid, "1", 0.25)
 
@@ -3414,10 +3840,11 @@ def finalize_tree_ids_mapping(
     if "source" not in ids2.columns:
         ids2["source"] = "manual"
 
-    derived_parts = ids2["series_id"].astype(str).map(_split_series_id_prefix_number_suffix)
-    derived_prefix = derived_parts.map(lambda x: str(x[0]))
-    derived_number = derived_parts.map(lambda x: str(x[1]))
-    derived_suffix = derived_parts.map(lambda x: str(x[2]))
+    derived_tree_parts = ids2["tree_label"].astype(str).map(_split_series_id_prefix_number_suffix)
+    derived_prefix = derived_tree_parts.map(lambda x: str(x[0]))
+    derived_number = derived_tree_parts.map(lambda x: str(x[1]))
+    derived_series_parts = ids2["series_id"].astype(str).map(_split_series_id_prefix_number_suffix)
+    derived_suffix = derived_series_parts.map(lambda x: str(x[2]))
 
     ids2["tree_label"] = ids2["tree_label"].astype(str).map(_normalize_series_id_token)
     ids2["core_label"] = ids2["core_label"].astype(str).map(_normalize_series_id_token)
@@ -3425,17 +3852,17 @@ def finalize_tree_ids_mapping(
         ids2["tree_prefix"]
         .astype(str)
         .str.upper()
-        .str.replace(r"[^A-Z]+", "", regex=True)
+        .str.replace(r"[^A-Z0-9]+", "", regex=True)
     )
     ids2["tree_number_text"] = (
         ids2["tree_number_text"]
         .astype(str)
         .str.replace(r"[^0-9]+", "", regex=True)
     )
-    ids2["tree_label"] = ids2["tree_label"].replace("", np.nan)
-    ids2["core_label"] = ids2["core_label"].replace("", np.nan)
-    ids2["tree_prefix"] = ids2["tree_prefix"].replace("", np.nan)
-    ids2["tree_number_text"] = ids2["tree_number_text"].replace("", np.nan)
+    ids2["tree_label"] = ids2["tree_label"].mask(ids2["tree_label"].eq(""), np.nan)
+    ids2["core_label"] = ids2["core_label"].mask(ids2["core_label"].eq(""), np.nan)
+    ids2["tree_prefix"] = ids2["tree_prefix"].mask(ids2["tree_prefix"].eq(""), np.nan)
+    ids2["tree_number_text"] = ids2["tree_number_text"].mask(ids2["tree_number_text"].eq(""), np.nan)
 
     ids2["tree_prefix"] = ids2["tree_prefix"].where(~ids2["tree_prefix"].isna(), derived_prefix)
     ids2["tree_number_text"] = ids2["tree_number_text"].where(~ids2["tree_number_text"].isna(), derived_number)
@@ -3475,20 +3902,48 @@ def finalize_tree_ids_mapping(
     return ids2
 
 
+def build_identity_tree_ids(series_names: list[str]) -> pd.DataFrame:
+    """Build a one-series-per-tree mapping without any automatic grouping."""
+    rows: list[dict[str, Any]] = []
+    for series_id in [str(x) for x in list(series_names)]:
+        sid = _normalize_series_id_token(series_id)
+        rows.append(
+            {
+                "series_id": str(series_id),
+                "tree_prefix": "",
+                "tree_number_text": "",
+                "tree_label": str(sid or series_id),
+                "core_label": "1",
+                "confidence": 0.0,
+                "source": "identity",
+            }
+        )
+    return finalize_tree_ids_mapping(pd.DataFrame(rows), series_names=[str(x) for x in list(series_names)])
+
+
 def build_auto_tree_ids(
     series_names: list[str],
     suffix_variant_lines: Optional[list[str]] = None,
     group_pattern_lines: Optional[list[str]] = None,
+    manual_prefix_lines: Optional[list[str]] = None,
+    rwl: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Build an automatic tree/core mapping table from series identifiers."""
     rows: list[dict[str, Any]] = []
     for series_id in [str(x) for x in list(series_names)]:
+        common_site_prefix = _choose_series_site_prefix(
+            series_id,
+            [str(x) for x in list(series_names)],
+            manual_prefixes=manual_prefix_lines,
+        )
         tree_label, core_label, confidence = _guess_tree_core_labels_from_series_id(
             series_id,
             suffix_variant_lines=suffix_variant_lines,
             group_pattern_lines=group_pattern_lines,
+            common_site_prefix=common_site_prefix,
         )
-        tree_prefix, tree_number_text, _suffix = _split_series_id_prefix_number_suffix(series_id)
+        _tree_prefix_from_label, tree_number_text, _suffix = _split_series_id_prefix_number_suffix(tree_label)
+        tree_prefix = _merge_series_prefix_parts(common_site_prefix, _tree_prefix_from_label)
         rows.append(
             {
                 "series_id": str(series_id),
@@ -3500,7 +3955,9 @@ def build_auto_tree_ids(
                 "source": "auto",
             }
         )
-    return finalize_tree_ids_mapping(pd.DataFrame(rows), series_names=[str(x) for x in list(series_names)])
+    rows_df = pd.DataFrame(rows)
+    rows_df = _apply_nonoverlap_split_guard(rows_df, rwl=rwl)
+    return finalize_tree_ids_mapping(rows_df, series_names=[str(x) for x in list(series_names)])
 
 
 def build_age_curve(rwl: pd. DataFrame) -> pd. Series:
@@ -8551,6 +9008,7 @@ class DetrendAdvisorApp(tk. Tk):
         self.compat_mode_var = tk.StringVar(value="dplR")
         self.enable_dplr_ssf_var = tk.BooleanVar(value=False)
         self.enable_dplr_rcs_sf_var = tk.BooleanVar(value=False)
+        self.enable_tree_grouping_var = tk.BooleanVar(value=False)
         self.radius_suffix_variants_var = tk.StringVar(value=_default_radius_suffix_variants_text())
         self.series_group_patterns_var = tk.StringVar(value=_default_series_group_patterns_text())
         self.dplr_parallel_workers_var = tk.StringVar(value="6")
@@ -8574,7 +9032,22 @@ class DetrendAdvisorApp(tk. Tk):
         self.score_w_rbar_var = tk.DoubleVar(value=float(_score0["w_rbar"]))
         self.score_w_clim_var = tk.DoubleVar(value=float(_score0["w_climate"]))
         self.status_var = tk.StringVar(value="Load data to begin.")
+        self._powt_sync_in_progress = False
+        self._powt_display_sync_in_progress = False
+        self._powt_last_user_run_signature = (
+            bool(self.powt_use_for_run_var.get()),
+            str(self.powt_method_var.get()).strip(),
+            bool(self.powt_rescale_var.get()),
+        )
+        self.powt_use_for_run_var.trace_add("write", lambda *_a: self._on_powt_run_controls_changed(source="main"))
+        self.enable_dplr_powt_var.trace_add("write", lambda *_a: self._on_powt_run_controls_changed(source="tab"))
+        self.powt_method_var.trace_add("write", lambda *_a: self._on_powt_run_controls_changed(source="main"))
+        self.dplr_powt_method_var.trace_add("write", lambda *_a: self._on_powt_run_controls_changed(source="tab"))
+        self.powt_rescale_var.trace_add("write", lambda *_a: self._on_powt_run_controls_changed(source="main"))
+        self.dplr_powt_rescale_var.trace_add("write", lambda *_a: self._on_powt_run_controls_changed(source="tab"))
+        self.show_powt_results_var.trace_add("write", self._on_powt_display_changed)
         self.min_series_info_var = tk.StringVar(value="Detrending start year: n/a")
+        self.manual_tree_prefixes_var = tk.StringVar(value="")
         self.dataset_var = tk.StringVar(value="")
         self.compare_mode_var = tk. StringVar(value="selected_method")
         self.compare_method_var = tk. StringVar(value="best")
@@ -8796,6 +9269,40 @@ class DetrendAdvisorApp(tk. Tk):
             "- POWT: inspect automatically computed power-transformation preview and POWT-based results when POWT is enabled.\n"
             "- Compare: compare chronologies across datasets or methods using the active compare settings.\n"
             "- Guide: read method explanations and goal-oriented notes.\n\n"
+
+            "Implemented analysis methods:\n"
+            "- Negative exponential / modified negative exponential.\n"
+            "- Linear, mean, and running mean detrending.\n"
+            "- Hugershoff and LOWESS-style detrending.\n"
+            "- Spline detrending with multiple fixed lengths and age-dependent spline.\n"
+            "- AR detrending.\n"
+            "- RCS and signal-free RCS.\n"
+            "- Signal-free spline and signal-free age-dependent spline variants.\n\n"
+
+            "Tree groups and IDs:\n"
+            "- Tree groups opens the tree/core grouping editor for Series ID parsing.\n"
+            "- You can define editable pattern groups for Series ID parsing and editable core/radius suffix variants.\n"
+            "- Auto grouping can rebuild tree/core labels from Series ID rules.\n"
+            "- Non-overlapping time segments with the same code can be kept separate.\n"
+            "- You can also edit selected tree labels and core labels manually before saving.\n\n"
+
+            "POWT controls:\n"
+            "- POWT can be enabled or disabled by the user for the analysis run.\n"
+            "- POWT method selects the dplR power-transformation mode.\n"
+            "- Export POWT+NoPOWT keeps both result branches available for export and review when enabled.\n"
+            "- The POWT tab shows transformation preview diagnostics and lets you inspect POWT-based outputs.\n\n"
+
+            "R / dplR backend:\n"
+            "- The application uses the dplR backend for analysis in this build.\n"
+            "- Rscript and the dplR package are detected automatically when possible.\n"
+            "- If automatic detection fails, the user can select Rscript manually.\n"
+            "- The application can also try online installation of R or dplR on supported systems.\n\n"
+
+            "Exports and interoperability:\n"
+            "- Export writes chronologies, RWI outputs, and a report to the selected export folder.\n"
+            "- Excel-only and CSV+Excel export modes are available.\n"
+            "- RingClim can be launched from the application and prefilled with exported detrended outputs.\n\n"
+ 
             "Button notes:\n"
             "- Tree groups...: open the tree/core review dialog for the active dataset.\n"
             "- Score settings...: open the score dialog for frequency cutoffs and score weights.\n"
@@ -8986,6 +9493,7 @@ class DetrendAdvisorApp(tk. Tk):
                 f"(backend={backend}, workers={workers}, skipped {skipped}). "
                 f"Active: {active_key} (best={active_best})"
             )
+            self._apply_active_dataset_powt_display_choice()
             self._refresh_dataset_ui_state()
             self._mark_project_dirty()
             self._bump_project_version()
@@ -9532,7 +10040,17 @@ class DetrendAdvisorApp(tk. Tk):
                     ds.powt_recommendation_flag = flag
                     ds.powt_recommendation_text = note
                     ds.advisor_result = chosen or ar_no_powt or ar_with_powt
-                    ds.displayed_result_mode = "recommended"
+                    if bool(self.show_powt_results_var.get()) and ar_with_powt is not None:
+                        ds.displayed_result_mode = "with_powt"
+                        ds.advisor_result = ar_with_powt
+                        ds.powt_preview_result = powt_res
+                    elif (not bool(self.show_powt_results_var.get())) and ar_no_powt is not None:
+                        ds.displayed_result_mode = "no_powt"
+                        ds.advisor_result = ar_no_powt
+                        ds.powt_preview_result = None
+                    else:
+                        ds.displayed_result_mode = "recommended"
+                        ds.powt_preview_result = powt_res if bool(self.show_powt_results_var.get()) else None
                     ds.compat_signature = compat_sig
                     self._invalidate_pairwise_compare_cache_for_dataset_key(key)
 
@@ -10381,13 +10899,14 @@ class DetrendAdvisorApp(tk. Tk):
         """
         method_now = self._selected_powt_display_method() or "universal"
         rescale_now = bool(self.dplr_powt_rescale_var.get())
+        run_enabled_now = bool(self.enable_dplr_powt_var.get())
         self.powt_method_var.set(method_now)
         self.powt_rescale_var.set(rescale_now)
-        self.powt_use_for_run_var.set(rescale_now)
+        self.powt_use_for_run_var.set(True if force_enable else run_enabled_now)
         if force_enable:
-            self.enable_dplr_powt_var.set(rescale_now)
+            self.enable_dplr_powt_var.set(True)
         else:
-            self.enable_dplr_powt_var.set(bool(self.powt_use_for_run_var.get()) and rescale_now)
+            self.enable_dplr_powt_var.set(run_enabled_now)
         self.dplr_powt_method_var.set(method_now)
         self.dplr_powt_rescale_var.set(rescale_now)
         self._on_compat_mode_changed()
@@ -10497,57 +11016,123 @@ class DetrendAdvisorApp(tk. Tk):
 
         resolved_rscript = _resolve_rscript_path(cfg.rscript)
         if not resolved_rscript:
+
+            manual_now = messagebox.askyesno(
+                "R runtime not found",
+                "dplR backend requires R and Rscript, but Rscript was not found.\n\n"
+                "Yes = select the Rscript executable manually.\n"
+                "No = continue with other options.",
+            )
+            if manual_now:
+                manual_path = _ask_user_for_rscript_path(parent=self)
+                if manual_path:
+                    cfg.rscript = str(manual_path)
+                    resolved_rscript = str(manual_path)
+                else:
+                    messagebox.showwarning(
+                        "Rscript not selected",
+                        "No valid Rscript executable was selected.",
+                        parent=self,
+                    )
+
+        if not resolved_rscript:
             use_python = messagebox.askyesno(
                 "R runtime not found",
                 "dplR backend requires R and Rscript, but Rscript was not found.\n\n"
                 "Yes = switch to the internal Python backend for this run.\n"
-                "No = continue and choose an installation option.",
+                "No = try to locate or install R.",
             )
             if use_python:
-                return self._fallback_to_legacy_backend(
-                    "R runtime is not installed or Rscript is not on PATH."
-                )
+                cfg.compat = "legacy"
+                self.status_var.set("Using Python backend for this run.")
+                return cfg
+
             if os.name == "nt":
                 install_now = messagebox.askyesno(
-                    "R runtime not found",
-                    "Attempt online installation of R now?\n\n"
-                    "This uses winget or chocolatey and requires internet access.",
+                    "Install R runtime",
+                    "Rscript was not found.\n\n"
+                    "Yes = try online installation of R now.\n"
+                    "No = cancel this run.",
                 )
                 if install_now:
                     cfg.auto_install_r = True
                     self.status_var.set("Trying to install R runtime online...")
                     self.update_idletasks()
                     ok_r, install_log = _try_install_r_windows_online()
-                    if not ok_r:
+                    resolved_after = _resolve_rscript_path(cfg.rscript)
+                    if not resolved_after:
+                        for cand in _iter_known_rscript_candidates(cfg.rscript):
+                            resolved_after = str(cand)
+                            break
+                    if not resolved_after:
+                        manual_after_install = messagebox.askyesno(
+                            "Rscript still not found",
+                            "Automatic detection still did not find Rscript.\n\n"
+                            "Yes = select the Rscript executable manually.\n"
+                            "No = continue with fallback handling.",
+                            parent=self,
+                        )
+                        if manual_after_install:
+                            manual_path = _ask_user_for_rscript_path(parent=self)
+                            if manual_path:
+                                resolved_after = str(manual_path)
+                    if not resolved_after:
                         detail = install_log.strip()
                         if detail:
                             detail = "\n\n" + detail
                         return self._fallback_to_legacy_backend(
                             "Online installation of R failed." + detail
                         )
-                    resolved_after = _resolve_rscript_path(cfg.rscript)
-                    if not resolved_after:
-                        detail = install_log.strip()
-                        if detail:
-                            detail = "\n\n" + detail
-                        return self._fallback_to_legacy_backend(
-                            "R installation finished, but Rscript still could not be found." + detail
-                        )
-                    cfg.rscript = resolved_after
-                    self.status_var.set("R runtime installed. Checking dplR package...")
+                    cfg.rscript = str(resolved_after)
+                    self.status_var.set("R runtime found after installation.")
                 else:
                     self.status_var.set("Analysis cancelled: R runtime is required for dplR backend.")
                     return None
             else:
-                messagebox.showwarning(
+                manual_on_non_windows = messagebox.askyesno(
                     "R runtime not found",
-                    "R runtime is not installed or Rscript is not on PATH.\n\n"
-                    "Automatic online installation is only implemented for Windows in this build."
+                    "Automatic detection did not find Rscript.\n\n"
+                    "Yes = select the Rscript executable manually.\n"
+                    "No = cancel this run.",
+                    parent=self,
                 )
-                self.status_var.set("Analysis cancelled: R runtime is required for dplR backend.")
-                return None
+                if manual_on_non_windows:
+                    manual_path = _ask_user_for_rscript_path(parent=self)
+                    if manual_path:
+                        cfg.rscript = str(manual_path)
+                        resolved_rscript = str(manual_path)
+                    else:
+                        self.status_var.set("Analysis cancelled: R runtime is required for dplR backend.")
+                        return None
+                else:
+                    self.status_var.set("Analysis cancelled: R runtime is required for dplR backend.")
+                    return None
+
+        else:
+            cfg.rscript = str(resolved_rscript)
+
+        rscript_with_dplr = _find_rscript_with_package(cfg, "dplR")
+        if rscript_with_dplr:
+            cfg.rscript = str(rscript_with_dplr)
+            self.status_var.set("Found R runtime and R package 'dplR'.")
+            return cfg
 
         if not _dplr_package_available(cfg):
+            try_other_rscript = messagebox.askyesno(
+                "dplR package not found",
+                "R was found, but the selected R installation cannot load the package 'dplR'.\n\n"
+                "Yes = select another Rscript executable manually.\n"
+                "No = continue with package installation or fallback.",
+                parent=self,
+            )
+            if try_other_rscript:
+                manual_path = _ask_user_for_rscript_path(parent=self)
+                if manual_path:
+                    cfg.rscript = str(manual_path)
+                    if _dplr_package_available(cfg):
+                        self.status_var.set("Found R runtime and R package 'dplR'.")
+                        return cfg
+
             use_python = messagebox.askyesno(
                 "dplR package not found",
                 "R was found, but the R package 'dplR' is not installed.\n\n"
@@ -10567,6 +11152,9 @@ class DetrendAdvisorApp(tk. Tk):
                 self.status_var.set("Trying to install R package 'dplR' from CRAN...")
                 self.update_idletasks()
                 ok, output = _try_install_dplr_package(cfg)
+                rscript_with_dplr = _find_rscript_with_package(cfg, "dplR")
+                if rscript_with_dplr:
+                    cfg.rscript = str(rscript_with_dplr)
                 if not ok or not _dplr_package_available(cfg):
                     detail = output.strip()
                     if detail:
@@ -10778,12 +11366,30 @@ class DetrendAdvisorApp(tk. Tk):
             "Shows the first year that meets the current minimum count threshold."
         )
 
+        self.tree_groups_group = ttk.Frame(self.topbar)
+        self._register_topbar_widget(self.tree_groups_group, pad_x=0, pad_y=0, row_hint=1)
+        self.chk_enable_tree_grouping = ttk.Checkbutton(
+            self.tree_groups_group,
+            text="Tree groups",
+            variable=self.enable_tree_grouping_var,
+            command=self._on_tree_grouping_toggle_changed,
+        )
+        self.chk_enable_tree_grouping.pack(side=tk.LEFT, anchor="w")
         self.btn_tree_groups = ttk.Button(
-            self.topbar,
-            text="Tree groups...",
+            self.tree_groups_group,
+            text="...",
+            width=3,
             command=self.on_edit_tree_groups,
         )
-        self._register_topbar_widget(self.btn_tree_groups, pad_x=0, pad_y=0, row_hint=1)
+        self.btn_tree_groups.pack(side=tk.LEFT, padx=(4, 0))
+        _attach_hover_tooltip(
+            self.chk_enable_tree_grouping,
+            "Enable automatic grouping of multiple series into trees. When off, each series is treated as its own tree."
+        )
+        _attach_hover_tooltip(
+            self.btn_tree_groups,
+            "Edit automatic tree-grouping rules and review grouped series."
+        )
 
         self.chk_dplr_powt = ttk.Checkbutton(
             self.topbar,
@@ -11180,6 +11786,53 @@ class DetrendAdvisorApp(tk. Tk):
             i += 1
         return key
 
+    def _build_ids_for_series_names(self, series_names: list[str]) -> pd.DataFrame:
+        """Build ids using either identity mapping or automatic tree grouping."""
+        names = [str(x) for x in list(series_names)]
+        if bool(self.enable_tree_grouping_var.get()):
+            return build_auto_tree_ids(
+                names,
+                suffix_variant_lines=self._get_radius_suffix_variant_lines(),
+                group_pattern_lines=self._get_series_group_pattern_lines(),
+                manual_prefix_lines=self._get_manual_tree_prefix_lines(),
+                rwl=getattr(self.datasets.get(self.active_dataset_key), "rwl", None)
+                if self.active_dataset_key and self.active_dataset_key in self.datasets
+                else None,
+            )
+        return build_identity_tree_ids(names)
+
+    def _apply_tree_grouping_mode_to_dataset(self, ds: Any) -> None:
+        """Rebuild one dataset ids table according to the current tree-grouping mode."""
+        if ds is None or getattr(ds, "rwl", None) is None:
+            return
+        if bool(self.enable_tree_grouping_var.get()):
+            ds.ids = build_auto_tree_ids(
+                [str(x) for x in list(ds.rwl.columns)],
+                suffix_variant_lines=self._get_radius_suffix_variant_lines(),
+                group_pattern_lines=self._get_series_group_pattern_lines(),
+                manual_prefix_lines=self._get_manual_tree_prefix_lines(),
+                rwl=ds.rwl,
+            )
+        else:
+            ds.ids = build_identity_tree_ids([str(x) for x in list(ds.rwl.columns)])
+        ds.ids_source = "auto" if bool(self.enable_tree_grouping_var.get()) else "identity"
+
+    def _on_tree_grouping_toggle_changed(self) -> None:
+        """Apply the current tree-grouping mode to datasets that are still auto-managed."""
+        for ds in self.datasets.values():
+            if ds is None or getattr(ds, "rwl", None) is None:
+                continue
+            if bool(getattr(ds, "ids_reviewed", False)):
+                continue
+            self._apply_tree_grouping_mode_to_dataset(ds)
+        if self.active_dataset_key and self.active_dataset_key in self.datasets:
+            ds_active = self.datasets.get(self.active_dataset_key)
+            if ds_active is not None:
+                self.ids = getattr(ds_active, "ids", None)
+        self._update_min_series_info_for_active_dataset()
+        self._mark_project_dirty()
+        self._bump_project_version()
+
     def _ensure_dataset_ids_initialized(self, ds: Any) -> None:
         """Ensure one dataset has a usable ids mapping table."""
         if ds is None or getattr(ds, "rwl", None) is None:
@@ -11187,12 +11840,8 @@ class DetrendAdvisorApp(tk. Tk):
         series_names = [str(x) for x in list(ds.rwl.columns)]
         ids_obj = getattr(ds, "ids", None)
         if ids_obj is None or not isinstance(ids_obj, pd.DataFrame) or ids_obj.empty:
-            ds.ids = build_auto_tree_ids(
-                series_names,
-                suffix_variant_lines=self._get_radius_suffix_variant_lines(),
-                group_pattern_lines=self._get_series_group_pattern_lines(),
-            )
-            ds.ids_source = "auto"
+            ds.ids = build_identity_tree_ids(series_names)
+            ds.ids_source = "identity"
             if not hasattr(ds, "ids_reviewed"):
                 ds.ids_reviewed = False
             return
@@ -11226,21 +11875,36 @@ class DetrendAdvisorApp(tk. Tk):
         """Return the current editable list of Series ID grouping patterns."""
         return _parse_series_group_patterns(self.series_group_patterns_var.get())
 
+    def _get_manual_tree_prefix_lines(self) -> list[str]:
+        """Return user-defined prefixes that should influence automatic tree grouping."""
+        return _parse_manual_tree_prefixes(self.manual_tree_prefixes_var.get())
+
+    def _get_tree_grouping_dialog_radius_lines(self) -> list[str]:
+        """Return radius/core suffix variants from the open tree-groups dialog when available."""
+        if hasattr(self, "tree_grouping_radius_variants_text"):
+            text = self.tree_grouping_radius_variants_text.get("1.0", tk.END).strip()
+            return _parse_radius_suffix_variants(text)
+        return self._get_radius_suffix_variant_lines()
+
+    def _get_tree_grouping_dialog_pattern_lines(self) -> list[str]:
+        """Return Series ID grouping patterns from the open tree-groups dialog when available."""
+        text = ""
+        if hasattr(self, "tree_group_pattern_entry"):
+            text = str(self.tree_group_pattern_entry.get() or "").strip()
+        if not text and hasattr(self, "tree_group_pattern_var"):
+            text = str(self.tree_group_pattern_var.get() or "").strip()
+        if text:
+            return _parse_series_group_patterns(text)
+        return self._get_series_group_pattern_lines()
+
     def _rebuild_auto_ids_for_unreviewed_datasets(self) -> None:
         """Rebuild automatic ids for datasets that have not been reviewed manually."""
-        suffix_lines = self._get_radius_suffix_variant_lines()
-        group_pattern_lines = self._get_series_group_pattern_lines()
         for ds in self.datasets.values():
             if ds is None or getattr(ds, "rwl", None) is None:
                 continue
             if bool(getattr(ds, "ids_reviewed", False)):
                 continue
-            ds.ids = build_auto_tree_ids(
-                [str(x) for x in list(ds.rwl.columns)],
-                suffix_variant_lines=suffix_lines,
-                group_pattern_lines=group_pattern_lines,
-            )
-            ds.ids_source = "auto"
+            self._apply_tree_grouping_mode_to_dataset(ds)
         if self.active_dataset_key and self.active_dataset_key in self.datasets:
             ds_active = self.datasets.get(self.active_dataset_key)
             if ds_active is not None:
@@ -11349,16 +12013,46 @@ class DetrendAdvisorApp(tk. Tk):
         self,
         work_df: pd.DataFrame,
         selected_series_ids: list[str],
+        suffix_variant_lines: Optional[list[str]] = None,
+        group_pattern_lines: Optional[list[str]] = None,
+        common_site_prefix_override: str = "",
+        manual_prefix_lines: Optional[list[str]] = None,
     ) -> pd.DataFrame:
+
         """Rebuild auto-detected labels for selected series rows."""
         out = work_df.copy()
+        suffix_lines_use = (
+            list(suffix_variant_lines)
+            if suffix_variant_lines is not None
+            else self._get_tree_grouping_dialog_radius_lines()
+        )
+        group_patterns_use = (
+            list(group_pattern_lines)
+            if group_pattern_lines is not None
+            else self._get_tree_grouping_dialog_pattern_lines()
+        )
+        manual_prefix_lines_use = (
+            list(manual_prefix_lines)
+            if manual_prefix_lines is not None
+            else self._get_tree_grouping_dialog_manual_prefix_lines()
+        )
         for series_id in [str(x) for x in list(selected_series_ids)]:
+            common_site_prefix_use = (
+                _normalize_series_id_token(common_site_prefix_override)
+                or _choose_series_site_prefix(
+                    series_id,
+                    [str(x) for x in out["series_id"].tolist()],
+                    manual_prefixes=manual_prefix_lines_use,
+                )
+            )
             tree_label, core_label, confidence = _guess_tree_core_labels_from_series_id(
                 series_id,
-                suffix_variant_lines=self._get_radius_suffix_variant_lines(),
-                group_pattern_lines=self._get_series_group_pattern_lines(),
+                suffix_variant_lines=suffix_lines_use,
+                group_pattern_lines=group_patterns_use,
+                common_site_prefix=common_site_prefix_use,
             )
-            tree_prefix, tree_number_text, _suffix = _split_series_id_prefix_number_suffix(series_id)
+            _tree_prefix_from_label, tree_number_text, _suffix = _split_series_id_prefix_number_suffix(tree_label)
+            tree_prefix = _merge_series_prefix_parts(common_site_prefix_use, _tree_prefix_from_label)
             if series_id not in out.index:
                 out.loc[series_id, "series_id"] = series_id
             out.loc[series_id, "tree_prefix"] = str(tree_prefix)
@@ -11367,6 +12061,11 @@ class DetrendAdvisorApp(tk. Tk):
             out.loc[series_id, "core_label"] = str(core_label)
             out.loc[series_id, "confidence"] = float(confidence)
             out.loc[series_id, "source"] = "auto"
+        ds = self.datasets.get(self.active_dataset_key) if self.active_dataset_key else None
+        out = _apply_nonoverlap_split_guard(
+            out,
+            rwl=getattr(ds, "rwl", None) if ds is not None else None,
+        )
         return finalize_tree_ids_mapping(out, series_names=[str(x) for x in out["series_id"].tolist()])
 
     def _populate_tree_grouping_treeview(self) -> None:
@@ -11481,19 +12180,75 @@ class DetrendAdvisorApp(tk. Tk):
                 self.tree_grouping_tree.selection_add(series_id)
         self._sync_tree_grouping_form_from_selection()
 
-    def _rebuild_tree_grouping_all_auto(self) -> None:
+    def _rebuild_tree_grouping_all_auto(
+        self,
+        suffix_variant_lines: Optional[list[str]] = None,
+        group_pattern_lines: Optional[list[str]] = None,
+        manual_prefix_lines: Optional[list[str]] = None,
+    ) -> None:
         """Rebuild the whole mapping table from automatic guesses."""
         if self._tree_grouping_working_df is None or self._tree_grouping_working_df.empty:
             return
         series_names = [str(x) for x in self._tree_grouping_working_df["series_id"].tolist()]
-        self._tree_grouping_working_df = build_auto_tree_ids(
-            series_names,
-            suffix_variant_lines=self._get_radius_suffix_variant_lines(),
-            group_pattern_lines=self._get_series_group_pattern_lines(),
+        suffix_lines_use = (
+            list(suffix_variant_lines)
+            if suffix_variant_lines is not None
+            else self._get_tree_grouping_dialog_radius_lines()
         )
+        group_patterns_use = (
+            list(group_pattern_lines)
+            if group_pattern_lines is not None
+            else self._get_tree_grouping_dialog_pattern_lines()
+        )
+        manual_prefix_lines_use = (
+            list(manual_prefix_lines)
+            if manual_prefix_lines is not None
+            else self._get_tree_grouping_dialog_manual_prefix_lines()
+        )
+        if bool(self.enable_tree_grouping_var.get()):
+            ds = self.datasets.get(self.active_dataset_key) if self.active_dataset_key else None
+            self._tree_grouping_working_df = build_auto_tree_ids(
+                series_names,
+                suffix_variant_lines=suffix_lines_use,
+                group_pattern_lines=group_patterns_use,
+                manual_prefix_lines=manual_prefix_lines_use,
+                rwl=getattr(ds, "rwl", None) if ds is not None else None,
+            )
+        else:
+            self._tree_grouping_working_df = build_identity_tree_ids(series_names)
         self._update_tree_grouping_summary_label()
         self._populate_tree_grouping_treeview()
         self._sync_tree_grouping_form_from_selection()
+
+    def _get_tree_grouping_dialog_manual_prefix_lines(self) -> list[str]:
+        """Return user-defined prefixes from the tree-grouping dialog."""
+        text = ""
+        if hasattr(self, "tree_group_prefix_entry"):
+            text = str(self.tree_group_prefix_entry.get() or "").strip()
+        if not text and hasattr(self, "tree_group_prefix_var"):
+            text = str(self.tree_group_prefix_var.get() or "").strip()
+        return _parse_manual_tree_prefixes(text)
+
+    def _apply_tree_grouping_prefixes_and_rebuild(self) -> None:
+        """Save user-defined prefixes from the dialog and rebuild auto grouping."""
+        if not hasattr(self, "tree_group_prefix_var"):
+            return
+        try:
+            self.tree_grouping_dialog.update_idletasks()
+        except Exception:
+            pass
+        text = ""
+        if hasattr(self, "tree_group_prefix_entry"):
+            text = str(self.tree_group_prefix_entry.get() or "").strip()
+        if not text:
+            text = str(self.tree_group_prefix_var.get() or "").strip()
+        lines = _parse_manual_tree_prefixes(text)
+        self.manual_tree_prefixes_var.set(", ".join(lines))
+        self.tree_group_prefix_var.set(", ".join(lines))
+        if hasattr(self, "tree_group_prefix_entry"):
+            self.tree_group_prefix_entry.delete(0, tk.END)
+            self.tree_group_prefix_entry.insert(0, ", ".join(lines))
+        self._rebuild_tree_grouping_all_auto(manual_prefix_lines=lines)
 
     def _apply_tree_grouping_patterns_and_rebuild(self) -> None:
         """Save Series ID grouping patterns from the dialog and rebuild auto grouping."""
@@ -11521,7 +12276,7 @@ class DetrendAdvisorApp(tk. Tk):
         if hasattr(self, "tree_group_pattern_entry"):
             self.tree_group_pattern_entry.delete(0, tk.END)
             self.tree_group_pattern_entry.insert(0, ", ".join(lines))
-        self._rebuild_tree_grouping_all_auto()
+        self._rebuild_tree_grouping_all_auto(group_pattern_lines=lines)
 
     def _get_tree_grouping_counts(
         self,
@@ -11568,6 +12323,15 @@ class DetrendAdvisorApp(tk. Tk):
             lines = _parse_radius_suffix_variants(text)
             if lines:
                 self.radius_suffix_variants_var.set("\n".join(lines))
+        if hasattr(self, "tree_group_prefix_var"):
+            prefix_text = ""
+            if hasattr(self, "tree_group_prefix_entry"):
+                prefix_text = str(self.tree_group_prefix_entry.get() or "").strip()
+            if not prefix_text:
+                prefix_text = str(self.tree_group_prefix_var.get() or "").strip()
+            prefix_lines = _parse_manual_tree_prefixes(prefix_text)
+            self.manual_tree_prefixes_var.set(", ".join(prefix_lines))
+            self.tree_group_prefix_var.set(", ".join(prefix_lines))
         if hasattr(self, "tree_group_pattern_var"):
             pattern_text = ""
             if hasattr(self, "tree_group_pattern_entry"):
@@ -11723,6 +12487,9 @@ class DetrendAdvisorApp(tk. Tk):
         form.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         self.tree_group_tree_var = tk.StringVar(value="")
         self.tree_group_core_var = tk.StringVar(value="")
+        self.tree_group_prefix_var = tk.StringVar(
+            value=", ".join(self._get_manual_tree_prefix_lines())
+        )
         self.tree_group_pattern_var = tk.StringVar(
             value=", ".join(self._get_series_group_pattern_lines())
         )
@@ -11739,20 +12506,34 @@ class DetrendAdvisorApp(tk. Tk):
         ttk.Button(form, text="Rebuild all auto", command=self._rebuild_tree_grouping_all_auto).grid(
             row=0, column=6, sticky="e", padx=(6, 8), pady=8
         )
-        ttk.Label(form, text="Pattern groups:").grid(row=1, column=0, sticky="w", padx=(8, 6), pady=(0, 8))
+        ttk.Label(form, text="User prefixes:").grid(row=1, column=0, sticky="w", padx=(8, 6), pady=(0, 8))
+        self.tree_group_prefix_entry = ttk.Entry(form, textvariable=self.tree_group_prefix_var, width=28)
+        self.tree_group_prefix_entry.grid(
+            row=1, column=1, columnspan=3, sticky="ew", pady=(0, 8)
+        )
+        self.tree_group_prefix_entry.bind("<Return>", lambda _event: self._apply_tree_grouping_prefixes_and_rebuild())
+        ttk.Button(form, text="Apply prefixes", command=self._apply_tree_grouping_prefixes_and_rebuild).grid(
+            row=1, column=4, sticky="e", padx=(12, 6), pady=(0, 8)
+        )
+        ttk.Label(
+            form,
+            text="Comma-separated prefixes that should influence auto detection.",
+            justify="left",
+        ).grid(row=1, column=5, columnspan=2, sticky="w", padx=(6, 8), pady=(0, 8))
+        ttk.Label(form, text="Pattern groups:").grid(row=2, column=0, sticky="w", padx=(8, 6), pady=(0, 8))
         self.tree_group_pattern_entry = ttk.Entry(form, textvariable=self.tree_group_pattern_var, width=28)
         self.tree_group_pattern_entry.grid(
-            row=1, column=1, columnspan=3, sticky="ew", pady=(0, 8)
+            row=2, column=1, columnspan=3, sticky="ew", pady=(0, 8)
         )
         self.tree_group_pattern_entry.bind("<Return>", lambda _event: self._apply_tree_grouping_patterns_and_rebuild())
         ttk.Button(form, text="Update", command=self._apply_tree_grouping_patterns_and_rebuild).grid(
-            row=1, column=4, sticky="e", padx=(12, 6), pady=(0, 8)
+            row=2, column=4, sticky="e", padx=(12, 6), pady=(0, 8)
         )
         ttk.Label(
             form,
             text="Examples: AAAABBC, BBC",
             justify="left",
-        ).grid(row=1, column=5, columnspan=2, sticky="w", padx=(6, 8), pady=(0, 8))
+        ).grid(row=2, column=5, columnspan=2, sticky="w", padx=(6, 8), pady=(0, 8))
 
         btns = ttk.Frame(root)
         btns.grid(row=4, column=0, sticky="e", pady=(10, 0))
@@ -11777,8 +12558,9 @@ class DetrendAdvisorApp(tk. Tk):
                 parent=self.tree_grouping_dialog,
             )
             return
-        self.radius_suffix_variants_var.set("\n".join(lines))
-        self._rebuild_tree_grouping_all_auto()
+        self.tree_grouping_radius_variants_text.delete("1.0", tk.END)
+        self.tree_grouping_radius_variants_text.insert("1.0", "\n".join(lines))
+        self._rebuild_tree_grouping_all_auto(suffix_variant_lines=lines)
 
 
     def _make_unique_key(self, base: str) -> str:
@@ -12308,18 +13090,14 @@ class DetrendAdvisorApp(tk. Tk):
                 errors.append(f"{os.path.basename(path)}: {exc}")
                 continue
             key = self._make_dataset_key(path)
-            ids_df = build_auto_tree_ids(
-                [str(x) for x in list(df.columns)],
-                suffix_variant_lines=self._get_radius_suffix_variant_lines(),
-                group_pattern_lines=self._get_series_group_pattern_lines(),
-            )
+            ids_df = self._build_ids_for_series_names([str(x) for x in list(df.columns)])
             self.datasets[key] = DatasetState(
                 key=key,
                 path=path,
                 rwl=df,
                 ids=ids_df,
                 ids_reviewed=False,
-                ids_source="auto",
+                ids_source="auto" if bool(self.enable_tree_grouping_var.get()) else "identity",
                 advisor_result=None,
             )
             loaded.append(key)
@@ -12335,8 +13113,11 @@ class DetrendAdvisorApp(tk. Tk):
             return
 
         self._refresh_dataset_ui_state()
-        if activate_first_if_none and self.active_dataset_key is None:
-            self.set_active_dataset(loaded[0])
+        if loaded:
+            if activate_first_if_none and self.active_dataset_key is None:
+                self.set_active_dataset(loaded[0])
+            else:
+                self.set_active_dataset(loaded[-1])
 
         self._mark_project_dirty()
         self._bump_project_version()
@@ -12347,10 +13128,10 @@ class DetrendAdvisorApp(tk. Tk):
         except Exception:
             pass
 
-        if loaded and self.active_dataset_key in self.datasets:
+        if bool(self.enable_tree_grouping_var.get()) and loaded and self.active_dataset_key in self.datasets:
             if messagebox.askyesno(
                 "Tree groups",
-                "Automatic tree grouping was created from Series ID names.\n\nReview and edit tree groups now?",
+                "Review automatic tree grouping from Series ID names now?",
             ):
                 try:
                     self.on_edit_tree_groups()
@@ -13435,6 +14216,142 @@ class DetrendAdvisorApp(tk. Tk):
             self.update_idletasks()
         except Exception:
             pass
+
+    def _powt_run_signature_from_vars(self) -> tuple[bool, str, bool]:
+        """Return the user-selected POWT run signature from the top controls."""
+        return (
+            bool(self.powt_use_for_run_var.get()),
+            str(self.powt_method_var.get()).strip() or str(DEFAULT_COMPAT_CONFIG.powt_method),
+            bool(self.powt_rescale_var.get()),
+        )
+
+    def _invalidate_analysis_cache_for_powt_change(self) -> None:
+        """Force a fresh analysis run after any POWT run-control change."""
+        for ds in self.datasets.values():
+            try:
+                ds.compat_signature = None
+            except Exception:
+                pass
+
+    def _sync_powt_control_vars(self, source: str = "main") -> None:
+        """Keep duplicated POWT control variables in sync.
+
+        Notes:
+            - source="main" means the top RUN controls are the source of truth.
+            - source="tab" means the POWT tab controls are the source of truth.
+            - This must stay two-way so the user can disable POWT from either place.
+        """
+        if self._powt_sync_in_progress:
+            return
+        self._powt_sync_in_progress = True
+        try:
+            src = str(source or "main").strip().lower()
+            if src == "tab":
+                run_enabled = bool(self.enable_dplr_powt_var.get())
+                method_text = str(self.dplr_powt_method_var.get()).strip() or str(DEFAULT_COMPAT_CONFIG.powt_method)
+                rescale_enabled = bool(self.dplr_powt_rescale_var.get())
+            else:
+                run_enabled = bool(self.powt_use_for_run_var.get())
+                method_text = str(self.powt_method_var.get()).strip() or str(DEFAULT_COMPAT_CONFIG.powt_method)
+                rescale_enabled = bool(self.powt_rescale_var.get())
+
+            if bool(self.powt_use_for_run_var.get()) != run_enabled:
+                self.powt_use_for_run_var.set(run_enabled)
+            if bool(self.enable_dplr_powt_var.get()) != run_enabled:
+                self.enable_dplr_powt_var.set(run_enabled)
+
+            if str(self.powt_method_var.get()).strip() != method_text:
+                self.powt_method_var.set(method_text)
+            if str(self.dplr_powt_method_var.get()).strip() != method_text:
+                self.dplr_powt_method_var.set(method_text)
+
+            if bool(self.powt_rescale_var.get()) != rescale_enabled:
+                self.powt_rescale_var.set(rescale_enabled)
+            if bool(self.dplr_powt_rescale_var.get()) != rescale_enabled:
+                self.dplr_powt_rescale_var.set(rescale_enabled)
+        finally:
+            self._powt_sync_in_progress = False
+
+    def _apply_active_dataset_powt_display_choice(self) -> None:
+        """Switch the visible active result immediately when POWT display is toggled."""
+        if self._powt_display_sync_in_progress:
+            return
+        ds = self.datasets.get(self.active_dataset_key) if self.active_dataset_key else None
+        if ds is None:
+            return
+
+        use_powt_display = bool(self.show_powt_results_var.get())
+        ar_no_powt = getattr(ds, "advisor_result_no_powt", None)
+        ar_with_powt = getattr(ds, "advisor_result_with_powt", None)
+
+        chosen_result = None
+        chosen_mode = "recommended"
+        chosen_powt_preview = None
+        if use_powt_display and ar_with_powt is not None:
+            chosen_result = ar_with_powt
+            chosen_mode = "with_powt"
+            chosen_powt_preview = getattr(ds, "powt_preview_for_run", None)
+        elif (not use_powt_display) and ar_no_powt is not None:
+            chosen_result = ar_no_powt
+            chosen_mode = "no_powt"
+            chosen_powt_preview = None
+        else:
+            chosen_result = getattr(ds, "advisor_result", None)
+            chosen_mode = str(getattr(ds, "displayed_result_mode", "recommended") or "recommended")
+            chosen_powt_preview = getattr(ds, "powt_preview_for_run", None) if use_powt_display else None
+
+        self._powt_display_sync_in_progress = True
+        try:
+            ds.displayed_result_mode = str(chosen_mode)
+            ds.powt_preview_result = chosen_powt_preview
+            self.advisor_result = chosen_result
+            try:
+                ds.advisor_result = chosen_result
+            except Exception:
+                pass
+        finally:
+            self._powt_display_sync_in_progress = False
+
+        try:
+            self._update_recommendation_text()
+        except Exception:
+            pass
+        try:
+            self.update_chron_plots()
+        except Exception:
+            pass
+        try:
+            self.update_structure_plots()
+        except Exception:
+            pass
+        try:
+            self.update_powt_tab()
+        except Exception:
+            pass
+        try:
+            self.update_signal_plots()
+        except Exception:
+            pass
+
+    def _on_powt_run_controls_changed(self, *_args, source: str = "main") -> None:
+        """Handle any user change in POWT run settings."""
+        if self._powt_sync_in_progress:
+            return
+        old_sig = tuple(self._powt_last_user_run_signature)
+        self._sync_powt_control_vars(source=source)
+        new_sig = self._powt_run_signature_from_vars()
+        self._powt_last_user_run_signature = new_sig
+        if new_sig != old_sig:
+            self._invalidate_analysis_cache_for_powt_change()
+            try:
+                self.status_var.set("POWT settings changed. RUN will recompute with the new POWT state.")
+            except Exception:
+                pass
+        self._apply_active_dataset_powt_display_choice()
+
+    def _on_powt_display_changed(self, *_args) -> None:
+        """Refresh visible plots and text immediately after POWT display toggling."""
+        self._apply_active_dataset_powt_display_choice()
 
     def _update_recommendation_text(self) -> None:
         """Fill recommendation tab with human-readable summary."""
