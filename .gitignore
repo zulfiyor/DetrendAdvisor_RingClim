@@ -1,43 +1,11 @@
-# Python cache
-__pycache__/
-*.py[cod]
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# Test/cache/tooling
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Build/dist artifacts
+.venv*/
 build/
 dist/
-*.egg-info/
-.pyinstaller/
-
-# PyInstaller artifacts
+release/
+__pycache__/
+*.pyc
 *.spec
-
-# Logs and runtime dumps
 *.log
-logs/
-runtime_logs/
-*.out
-*.err
-
-# Generated analysis outputs/reports (non-source)
-exports/
-reports/
-output/
-*.tmp
-*.bak
-
-# Editors / OS
+*.bak*
+*.patch
 .DS_Store
-.idea/
-.vscode/

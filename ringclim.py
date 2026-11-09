@@ -25,7 +25,14 @@ Notes:
 """
 import sys
 import os
+
+# Shared modules (dendro_*.py) live in the "dendro_modules" folder next to this script.
+# In the built program (PyInstaller) they are bundled, so the folder is not needed there.
+_DENDRO_MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dendro_modules")
+if os.path.isdir(_DENDRO_MODULES_DIR) and _DENDRO_MODULES_DIR not in sys.path:
+    sys.path.insert(0, _DENDRO_MODULES_DIR)
 import json
+import math
 import re
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
@@ -33,6 +40,7 @@ import pandas as pd
 import io
 import gzip
 import shutil
+import subprocess
 import tempfile
 import traceback
 
@@ -85,6 +93,9 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QSizePolicy,
     QStatusBar,
+    QTextBrowser,
+    QMenu,
+    QLayout,
 )
 from PySide6.QtCore import (
     Qt,
@@ -95,16 +106,340 @@ from PySide6.QtCore import (
     Signal,
     QThread,
     QTimer,
+    QEvent,
+    QPoint,
+    QRect,
+    QSize,
 )
 from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtGui import QGuiApplication, QFontMetrics
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+from PySide6.QtWidgets import QSplitter
+from PySide6.QtWidgets import QProgressDialog
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from typing import Optional, Dict, Any, List, Tuple
 
 # Month names used throughout (English short names)
 MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+
+# Shared correlation plots / style: dendro_plots.py (optional)
+try:
+    import dendro_plots as _dplots
+except Exception:
+    _dplots = None
+
+PLOT_MODES = [
+    "Overview",
+    "Monthly correlations",
+    "Window heatmap",
+    "Top windows",
+    "Time series",
+    "Running correlation",
+    "Scatter",
+]
+
+# Optional online data access (ITRDB + CRU TS): dendro_online.py / dendro_online_qt.py
+try:
+    import dendro_online_qt as _online_qt
+    _ONLINE_IMPORT_ERROR = ""
+except Exception as _online_exc:  # keep RingClim usable without the module
+    _online_qt = None
+    _ONLINE_IMPORT_ERROR = f"{type(_online_exc).__name__}: {_online_exc}"
+# Spatial (field) correlation page: dendro_field.py / dendro_field_qt.py (optional)
+try:
+    import dendro_field as _field
+    import dendro_field_qt as _field_qt
+    _FIELD_IMPORT_ERROR = ""
+except Exception as _field_exc:
+    _field = None
+    _field_qt = None
+    _FIELD_IMPORT_ERROR = f"{type(_field_exc).__name__}: {_field_exc}"
+# Moving correlation page: dendro_moving.py / dendro_moving_qt.py (optional)
+try:
+    import dendro_moving_qt as _moving_qt
+    _MOVING_IMPORT_ERROR = ""
+except Exception as _moving_exc:  # pragma: no cover
+    _moving_qt = None
+    _MOVING_IMPORT_ERROR = f"{type(_moving_exc).__name__}: {_moving_exc}"
+# Developer signature + hover help on every dialog: dendro_ui_help.py (optional)
+try:
+    import dendro_ui_help as _uihelp
+except Exception:
+    _uihelp = None
+# Releases, automatic updates, guides and contact: app_update*.py (optional)
+try:
+    import app_update as _appupd
+    import app_update_qt as _appupd_qt
+except Exception:  # pragma: no cover
+    _appupd = None
+    _appupd_qt = None
+class PrimaryButton(QPushButton):
+    """Green bold button whose size hint uses the bold font of the style sheet (no clipped text)."""
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        self.setProperty("primary", True)
+        self.setMinimumHeight(34)
+
+    def _text_width(self) -> int:
+        f = QFont(self.font())
+        f.setBold(True)
+        return QFontMetrics(f).horizontalAdvance(self.text()) + 2 * 18 + 16
+
+    def sizeHint(self):  # noqa: N802
+        sh = super().sizeHint()
+        sh.setWidth(max(sh.width(), self._text_width()))
+        return sh
+
+    def minimumSizeHint(self):  # noqa: N802
+        sh = super().minimumSizeHint()
+        sh.setWidth(max(sh.width(), self._text_width()))
+        return sh
+
+
+class FlowLayout(QLayout):
+    """Layout that places widgets in rows and wraps them when the window is narrow
+    (buttons are never cut on small screens or with large Windows scaling)."""
+
+    def __init__(self, parent=None, spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items = []
+        self._spacing = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:  # noqa: N802 (Qt API)
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):  # noqa: N802
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):  # noqa: N802
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only: bool) -> int:
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = eff.x(), eff.y(), 0
+        for item in self._items:
+            w = item.widget()
+            if w is not None and not w.isVisible() and not test_only:
+                continue
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._spacing
+            if next_x - self._spacing > eff.right() + 1 and line_h > 0:
+                x = eff.x()
+                y = y + line_h + self._spacing
+                next_x = x + hint.width() + self._spacing
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.bottom()
+
+
+class FlowBar(QWidget):
+    """Widget holding a FlowLayout; its height follows the number of wrapped rows (no overlapping)."""
+
+    def __init__(self, flow: "FlowLayout", parent=None) -> None:
+        super().__init__(parent)
+        self._flow = flow
+        self.setLayout(flow)
+        sp = self.sizePolicy()
+        sp.setHeightForWidth(True)
+        sp.setVerticalPolicy(QSizePolicy.Fixed)
+        self.setSizePolicy(sp)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._flow.heightForWidth(width)
+
+    def sizeHint(self):  # noqa: N802
+        w = self.width() if self.width() > 50 else 1200
+        return QSize(w, self._flow.heightForWidth(w))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        h = self._flow.heightForWidth(event.size().width())
+        if h != self.minimumHeight():
+            self.setMinimumHeight(h)
+            self.setMaximumHeight(h)
+
+
+ROMAN_MONTH_NAMES = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"]
+
+
+def _normalize_month_header_token(token: Any) -> Optional[str]:
+    """Map common month header variants to canonical English short names."""
+    if token is None:
+        return None
+
+    s = str(token).strip()
+    if not s:
+        return None
+
+    sl = s.lower()
+
+    # English short names
+    for idx, name in enumerate(MONTH_NAMES):
+        if sl == name.lower():
+            return MONTH_NAMES[idx]
+
+    # Russian short names
+    ru_months = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+    for idx, name in enumerate(ru_months):
+        if sl == name:
+            return MONTH_NAMES[idx]
+
+    # Roman numerals I..XII
+    su = s.upper()
+    for idx, name in enumerate(ROMAN_MONTH_NAMES):
+        if su == name:
+            return MONTH_NAMES[idx]
+
+    # Legacy Y1..Y12 month headers, but not Year/Years
+    if su.startswith("Y") and su not in ("YEAR", "YEARS"):
+        num_part = su[1:]
+        if num_part.isdigit():
+            month_idx = int(num_part)
+            if 1 <= month_idx <= 12:
+                return MONTH_NAMES[month_idx - 1]
+
+    return None
+
+
+def _looks_like_year_column_name(name: Any) -> bool:
+    """Return True if the column name looks like a year field."""
+    if name is None:
+        return False
+    s = str(name).strip().lower()
+    return s in {
+        "year", "years", "год", "годы", "yr", "yrs",
+        "year_1", "col_1",
+    }
+
+
+def _detect_station_metadata_columns(columns: List[Any]) -> Dict[str, Optional[str]]:
+    """Detect common station metadata columns by header name."""
+    alias_map = {
+        "country": {
+            "country", "country_id", "countrycode", "cntr", "nation",
+        },
+        "code_wmo": {
+            "code_wmo", "wmo", "wmo_code", "station_id", "stationid",
+            "station_code", "code",
+        },
+        "name": {
+            "name", "station", "station_name", "stationname",
+        },
+    }
+
+    out: Dict[str, Optional[str]] = {
+        "country": None,
+        "code_wmo": None,
+        "name": None,
+    }
+    for col in columns:
+        s = str(col).strip().lower()
+        for key, aliases in alias_map.items():
+            if out[key] is None and s in aliases:
+                out[key] = str(col)
+    return out
+
+
+def _detect_monthly_wide_columns(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Detect a wide monthly table with one year column and 12 month columns."""
+    if df is None or df.empty:
+        return None
+
+    cols = list(df.columns.astype(str))
+    if not cols:
+        return None
+
+    def _series_looks_like_years(series: pd.Series) -> bool:
+        try:
+            nums = pd.to_numeric(series.dropna(), errors="coerce")
+            nums = nums[nums.notna()]
+            if nums.empty:
+                return False
+            mn = float(nums.min())
+            mx = float(nums.max())
+            return (mn >= 1800 and mx <= 2100) or (mn >= 100 and mx <= 3000 and len(nums) >= 10)
+        except Exception:
+            return False
+
+    year_col: Optional[str] = None
+    for col in cols:
+        if _looks_like_year_column_name(col):
+            year_col = col
+            break
+
+    if year_col is None:
+        for col in cols:
+            try:
+                if _series_looks_like_years(df[col]):
+                    year_col = col
+                    break
+            except Exception:
+                continue
+
+    month_hits: List[Tuple[int, str]] = []
+    for col in cols:
+        canonical = _normalize_month_header_token(col)
+        if canonical is None:
+            continue
+        month_hits.append((MONTH_NAMES.index(canonical), col))
+
+    month_map: Dict[int, str] = {}
+    for month_idx, col_name in month_hits:
+        if month_idx not in month_map:
+            month_map[month_idx] = col_name
+
+    if year_col is None or len(month_map) < 12:
+        return None
+
+    month_cols = [month_map[i] for i in range(12) if i in month_map]
+    if len(month_cols) != 12:
+        return None
+
+    metadata_cols = [c for c in cols if c not in ([year_col] + month_cols)]
+    return {
+        "year_col": year_col,
+        "month_cols": month_cols,
+        "metadata_cols": metadata_cols,
+        "station_meta": _detect_station_metadata_columns(metadata_cols),
+    }
 
 # Daily labels used in daily-resolution analysis.
 # Leap-day is included as Feb29 so the full daily table has 366 positions.
@@ -963,6 +1298,7 @@ CLIMATE_PARAM_DEFAULT_AGG = {
     # Precipitation and others
     "Precipitation": "sum",
     "Runoff": "sum",
+    "River discharge": "mean",
     "Soil moisture": "mean",
     "Snow": "sum",
     "PDSI": "mean",
@@ -970,6 +1306,20 @@ CLIMATE_PARAM_DEFAULT_AGG = {
     "Sea-level pressure": "mean",
     "Wind speed": "mean",
     "Radiation": "sum",
+    # CRU TS variables
+    "Diurnal temperature range": "mean",
+    "Vapour pressure": "mean",
+    "Cloud cover": "mean",
+    "PET": "mean",
+    "Wet days": "sum",
+    "Frost days": "sum",
+    # Drought indices / water balance (online sources)
+    "SPEI": "mean",
+    "SPI": "mean",
+    "Climatic water deficit": "sum",
+    "Actual evapotranspiration": "sum",
+    "Vapour pressure deficit": "mean",
+    "Climate moisture index": "sum",
     "Other": "sum",
 }
 
@@ -1250,14 +1600,14 @@ CLIMATE_PARAM_ALIAS_RULES: List[Tuple[str, List[str]]] = [
     (
         "Temperature (min)",
         [
-            "tasmin", "tmin", "tmn", "tnn", "tn", "mintemp", "min temp",
+            "tasmin", "tmin", "tmn", "tnn", "tn", "mintemp", "min temp", "temperature 2 m min",
             "minimum temperature", "air temperature minimum", "daily minimum temperature",
         ],
     ),
     (
         "Temperature (max)",
         [
-            "tasmax", "tmax", "tmx", "txx", "tx", "maxtemp", "max temp",
+            "tasmax", "tmax", "tmx", "txx", "tx", "maxtemp", "max temp", "temperature 2 m max",
             "maximum temperature", "air temperature maximum", "daily maximum temperature",
         ],
     ),
@@ -1272,14 +1622,14 @@ CLIMATE_PARAM_ALIAS_RULES: List[Tuple[str, List[str]]] = [
         "Precipitation",
         [
             "precipitation", "precip", "pre", "prcp", "prc", "tp", "rain", "rainfall",
-            "wet", "rr", "pcp",
+            "rr", "pcp", "ppt", "pr", "precipitation sum", "total precipitation",
         ],
     ),
     (
         "Runoff",
         [
             "runoff", "discharge", "disch", "streamflow", "riverflow", "river flow", "flow",
-            "grdc", "qmonth", "q_month", "qmon", "qday", "q_day", "qdaily",
+            "grdc", "qmonth", "q_month", "qmon", "qday", "q_day", "qdaily", "q", "ro", "dis 24",
             "qhour", "q_hour", "mean daily discharge", "mean monthly discharge",
             "mean hourly discharge",
         ],
@@ -1287,7 +1637,7 @@ CLIMATE_PARAM_ALIAS_RULES: List[Tuple[str, List[str]]] = [
     (
         "Soil moisture",
         [
-            "soil moisture", "soilmoisture", "soil moist", "soilliq", "soil liquid",
+            "soil moisture", "soilmoisture", "soil moist", "soilliq", "soil liquid", "soil",
             "soil water", "soilwater", "root zone soil moisture", "rootzone soil moisture",
             "swvl", "mrso",
         ],
@@ -1329,10 +1679,68 @@ CLIMATE_PARAM_ALIAS_RULES: List[Tuple[str, List[str]]] = [
         "Radiation",
         [
             "radiation", "solar radiation", "shortwave", "longwave", "net radiation",
-            "surface radiation", "srad", "rsds", "rsus", "rlds", "rlus",
+            "surface radiation", "srad", "rsds", "rsus", "rlds", "rlus", "ssrd",
         ],
     ),
+    # SPI before SPEI: files of the SPEI source are named "SPEI_spi3_..."
+    ("SPI", ["spi", "standardised precipitation index", "standardized precipitation index"]),
+    ("SPEI", ["spei", "standardised precipitation evapotranspiration index",
+              "standardized precipitation evapotranspiration index"]),
+    ("Climate moisture index", ["cmi", "climate moisture index"]),
+    ("Climatic water deficit", ["def", "cwd", "climatic water deficit", "water deficit"]),
+    ("Vapour pressure deficit", ["vpd", "vapour pressure deficit", "vapor pressure deficit"]),
+    ("Vapour pressure", ["vap", "vapour pressure", "vapor pressure"]),
+    ("Actual evapotranspiration", ["aet", "actual evapotranspiration", "total evaporation"]),
+    ("PET", ["pet", "pev", "et 0", "eto", "potential evapotranspiration", "reference evapotranspiration",
+             "evapotranspiration", "potential evaporation"]),
+    ("Wet days", ["wet", "wet days", "wet day frequency"]),
+    ("Frost days", ["frs", "frost days", "frost day frequency"]),
+    ("Cloud cover", ["cld", "cloud cover", "cloudiness"]),
+    ("Diurnal temperature range", ["dtr", "diurnal temperature range"]),
 ]
+
+
+def batch_metadata_for_file(file_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Metadata of a file written by 'Download everything for the area' (datasets.json / summary.csv).
+
+    Looks in the file's folder and its parent; returns the manifest entry (name, kind, climate_param,
+    value_column, source_freq, monthly_agg, meta) or None.
+    """
+    if not file_path:
+        return None
+    base = os.path.basename(file_path)
+    stem = os.path.splitext(base)[0]
+    folder = os.path.dirname(os.path.abspath(file_path))
+    for d in (folder, os.path.dirname(folder)):
+        man = os.path.join(d, "datasets.json")
+        if os.path.isfile(man):
+            try:
+                with open(man, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                for e in data.get("datasets", []) if isinstance(data, dict) else data:
+                    if isinstance(e, dict) and os.path.basename(str(e.get("file", ""))) == base:
+                        return e
+            except Exception:
+                pass
+        summ = os.path.join(d, "summary.csv")
+        if os.path.isfile(summ):
+            try:
+                sm = pd.read_csv(summ, encoding="utf-8-sig")
+                for _i, r in sm.iterrows():
+                    nm = str(r.get("dataset", ""))
+                    safe = (re.sub(r"[^A-Za-z0-9._-]+", "_", nm).strip("_") or "dataset")[:80]
+                    if safe == stem or nm == stem:
+                        ct = r.get("climate_type")
+                        out = {"name": nm, "kind": str(r.get("kind") or "climate")}
+                        if isinstance(ct, str) and ct:
+                            out["climate_param"] = ct
+                        meta = {k: r.get(k) for k in ("source", "variable", "units", "lat", "lon", "citation")
+                                if not pd.isna(r.get(k, float("nan")))}
+                        out["meta"] = meta
+                        return out
+            except Exception:
+                pass
+    return None
 
 
 def _normalize_climate_guess_text(*parts: Any) -> str:
@@ -1353,8 +1761,14 @@ def _climate_guess_stem_from_path(file_path: Optional[str]) -> str:
     """Return file name stem for climate guessing, removing everything after the first dot."""
     if not file_path:
         return ""
-    base = os.path.basename(file_path)
-    stem = base.split(".", 1)[0]
+    stem = os.path.basename(file_path)
+    # remove real extensions only (".csv", ".txt.gz"); keep dots inside names such as "CRU4.10_pre_40.28N"
+    for _ in range(3):
+        root, ext = os.path.splitext(stem)
+        if ext and re.fullmatch(r"\.[A-Za-z][A-Za-z0-9]{0,4}", ext) and not re.search(r"[_\-]", ext):
+            stem = root
+        else:
+            break
     return stem.strip()
 
 
@@ -1529,6 +1943,187 @@ def _read_csv_robust(
             engine="python",
             encoding="latin1",
         )
+
+
+_LEGACY_XLS_CACHE: Dict[Tuple[str, int, int], str] = {}
+
+
+def _convert_legacy_xls_with_excel(path: str, out_path: str) -> str:
+    """Convert legacy .xls to .xlsx using installed Microsoft Excel via PowerShell COM."""
+    if os.name != "nt":
+        raise RuntimeError("Excel COM conversion is available only on Windows.")
+
+    in_ps = os.path.abspath(path).replace("'", "''")
+    out_ps = os.path.abspath(out_path).replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$excel = $null
+$workbook = $null
+try {{
+    $excel = New-Object -ComObject Excel.Application
+    $excel.Visible = $false
+    $excel.DisplayAlerts = $false
+    $workbook = $excel.Workbooks.Open('{in_ps}')
+    $workbook.SaveAs('{out_ps}', 51)
+    $workbook.Close($false)
+    $excel.Quit()
+}}
+finally {{
+    if ($workbook -ne $null) {{
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($workbook)
+    }}
+    if ($excel -ne $null) {{
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel)
+    }}
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}}
+"""
+    last_error: Optional[Exception] = None
+    for exe_name in ("powershell", "pwsh"):
+        exe_path = shutil.which(exe_name)
+        if not exe_path:
+            continue
+        try:
+            proc = subprocess.run(
+                [exe_path, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0 and os.path.isfile(out_path):
+                return out_path
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            last_error = RuntimeError(stderr or f"{exe_name} returned exit code {proc.returncode}.")
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("PowerShell was not found.")
+
+
+def _convert_legacy_xls_with_libreoffice(path: str, out_dir: str) -> str:
+    """Convert legacy .xls to .xlsx using LibreOffice in headless mode."""
+    source_path = os.path.abspath(path)
+    expected_out = os.path.join(
+        out_dir,
+        os.path.splitext(os.path.basename(source_path))[0] + ".xlsx",
+    )
+    last_error: Optional[Exception] = None
+    for exe_name in ("soffice", "libreoffice"):
+        exe_path = shutil.which(exe_name)
+        if not exe_path:
+            continue
+        try:
+            proc = subprocess.run(
+                [exe_path, "--headless", "--convert-to", "xlsx", "--outdir", out_dir, source_path],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0 and os.path.isfile(expected_out):
+                return expected_out
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            last_error = RuntimeError(stderr or f"{exe_name} returned exit code {proc.returncode}.")
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("LibreOffice was not found.")
+
+
+def _resolve_excel_source(path: str) -> Tuple[str, Optional[str]]:
+    """Return a readable Excel path and pandas engine, converting .xls when possible."""
+    ext = os.path.splitext(str(path))[1].lower()
+    if ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        return path, "openpyxl"
+    if ext != ".xls":
+        return path, None
+
+    try:
+        import xlrd  # noqa: F401
+        return path, "xlrd"
+    except Exception as xlrd_exc:
+        abs_path = os.path.abspath(path)
+        try:
+            stat = os.stat(abs_path)
+            cache_key = (abs_path, int(stat.st_mtime), int(stat.st_size))
+        except Exception:
+            cache_key = (abs_path, 0, 0)
+
+        cached_path = _LEGACY_XLS_CACHE.get(cache_key)
+        if cached_path and os.path.isfile(cached_path):
+            return cached_path, "openpyxl"
+
+        cache_root = os.path.join(tempfile.gettempdir(), "ringclim_xls_cache")
+        os.makedirs(cache_root, exist_ok=True)
+
+        safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(abs_path))[0]).strip("._")
+        if not safe_base:
+            safe_base = "workbook"
+        out_name = f"{safe_base}_{abs(hash(cache_key))}.xlsx"
+        out_path = os.path.join(cache_root, out_name)
+
+        conversion_errors: List[str] = []
+
+        if not os.path.isfile(out_path):
+            try:
+                _convert_legacy_xls_with_excel(abs_path, out_path)
+            except Exception as exc:
+                conversion_errors.append(f"Excel COM conversion failed: {exc}")
+
+            if not os.path.isfile(out_path):
+                try:
+                    converted = _convert_legacy_xls_with_libreoffice(abs_path, cache_root)
+                    if converted != out_path and os.path.isfile(converted):
+                        try:
+                            shutil.copy2(converted, out_path)
+                        except Exception:
+                            out_path = converted
+                except Exception as exc:
+                    conversion_errors.append(f"LibreOffice conversion failed: {exc}")
+
+        if os.path.isfile(out_path):
+            _LEGACY_XLS_CACHE[cache_key] = out_path
+            return out_path, "openpyxl"
+
+        details = "\n".join(conversion_errors).strip()
+        if details:
+            details = f"\n\nTried automatic conversion methods:\n{details}"
+        raise ImportError(
+            "Legacy Excel file (*.xls) could not be opened directly because 'xlrd' is not available, "
+            "and automatic conversion to .xlsx failed."
+            f"{details}\n\n"
+            "Install xlrd >= 2.0.1, or open the file in Excel/LibreOffice and save it as .xlsx."
+        ) from xlrd_exc
+
+
+def _read_excel_robust(
+    path: str,
+    sheet_name: Any = 0,
+    header: Optional[int] = 0,
+    skiprows: int = 0,
+):
+    """Read Excel with an explicit engine so pandas does not guess incorrectly."""
+    read_path, engine = _resolve_excel_source(path)
+    kwargs: Dict[str, Any] = {
+        "sheet_name": sheet_name,
+        "header": header,
+        "skiprows": skiprows,
+    }
+    if engine:
+        kwargs["engine"] = engine
+    return pd.read_excel(read_path, **kwargs)
+
+
+def _get_excel_sheet_names(path: str) -> List[str]:
+    """Return sheet names for an Excel workbook using the correct engine."""
+    read_path, engine = _resolve_excel_source(path)
+    if engine:
+        with pd.ExcelFile(read_path, engine=engine) as xls:
+            return list(xls.sheet_names)
+    with pd.ExcelFile(read_path) as xls:
+        return list(xls.sheet_names)
 
 def _normalize_path_for_windows(path: str) -> str:
     """
@@ -2022,6 +2617,645 @@ class PandasModel(QAbstractTableModel):
 # ---------------------------
 # Matplotlib canvas
 # ---------------------------
+# ---------------------------
+# Modern look, clipboard support and help dialogs
+# ---------------------------
+RINGCLIM_STYLESHEET = """
+QMainWindow, QDialog { background: #f3f5f9; }
+QWidget { color: #1f2937; }
+QLabel { background: transparent; }
+QPushButton {
+    background: #ffffff;
+    border: 1px solid #c9d2e0;
+    border-radius: 6px;
+    padding: 5px 12px;
+    min-height: 18px;
+}
+QPushButton:hover { background: #e8f0fe; border-color: #2563eb; }
+QPushButton:pressed { background: #dbe6fb; border-color: #1d4ed8; }
+QPushButton:focus { border-color: #2563eb; }
+QPushButton:disabled { color: #9ca3af; background: #eef1f5; border-color: #dde3ec; }
+QPushButton[primary="true"] {
+    background: #16a34a;
+    color: #ffffff;
+    border: 1px solid #15803d;
+    font-weight: 700;
+    padding: 6px 18px;
+}
+QPushButton[primary="true"]:hover { background: #15803d; }
+QPushButton[primary="true"]:pressed { background: #166534; }
+QPushButton[primary="true"]:disabled { background: #a7d8b5; border-color: #a7d8b5; }
+QLineEdit {
+    background: #ffffff;
+    border: 1px solid #c9d2e0;
+    border-radius: 5px;
+    padding: 3px 6px;
+    min-height: 18px;
+}
+QLineEdit:hover, QLineEdit:focus { border-color: #2563eb; }
+QLineEdit:disabled { background: #eef1f5; color: #9ca3af; }
+QComboBox, QSpinBox, QDoubleSpinBox { min-height: 22px; }
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    border: 1px solid #c9d2e0;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+}
+QGroupBox {
+    background: #fafbfd;
+    border: 1px solid #d5dce8;
+    border-radius: 8px;
+    margin-top: 14px;
+    padding-top: 8px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: #1e40af;
+}
+QTabWidget::pane {
+    border: 1px solid #d5dce8;
+    border-radius: 6px;
+    top: -1px;
+    background: #ffffff;
+}
+QTabBar::tab {
+    background: #e5e9f0;
+    color: #4b5563;
+    padding: 7px 18px;
+    border: 1px solid #d5dce8;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected { background: #ffffff; color: #1d4ed8; }
+QTabBar::tab:hover:!selected { background: #eef2f8; color: #1f2937; }
+QListWidget, QTreeWidget, QTableView, QTextEdit, QPlainTextEdit, QTextBrowser {
+    background: #ffffff;
+    border: 1px solid #d5dce8;
+    border-radius: 6px;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+}
+QTableView { gridline-color: #e5e9f0; alternate-background-color: #f8fafc; }
+QHeaderView::section {
+    background: #eef2f7;
+    color: #1f2937;
+    border: none;
+    border-right: 1px solid #d5dce8;
+    border-bottom: 1px solid #d5dce8;
+    padding: 4px 6px;
+}
+QStatusBar { background: #e9edf4; border-top: 1px solid #d5dce8; }
+QProgressBar {
+    background: #ffffff;
+    border: 1px solid #c9d2e0;
+    border-radius: 5px;
+    text-align: center;
+}
+QProgressBar::chunk { background: #2563eb; border-radius: 4px; }
+QMenu { background: #ffffff; border: 1px solid #c9d2e0; padding: 4px; }
+QMenu::item { padding: 5px 24px 5px 18px; border-radius: 4px; }
+QMenu::item:selected { background: #2563eb; color: #ffffff; }
+QMenu::item:disabled { color: #9ca3af; }
+QToolTip {
+    background: #1f2937;
+    color: #ffffff;
+    border: none;
+    padding: 5px 7px;
+}
+QScrollArea { border: none; background: transparent; }
+"""
+
+
+
+
+def _app_icon_search_dirs() -> List[str]:
+    """Return folders where the application icon files may be located."""
+    dirs: List[str] = []
+    for base in (
+        getattr(sys, "_MEIPASS", None),
+        os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else None,
+        os.path.dirname(os.path.abspath(__file__)),
+    ):
+        if not base:
+            continue
+        for sub in ("", "icons", os.path.join("build", "icons")):
+            cand = os.path.join(base, sub) if sub else base
+            if cand not in dirs:
+                dirs.append(cand)
+    return dirs
+
+
+def _find_app_icon_files(app_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (ico_path, png_path) for the application icon, if present."""
+    ico_path: Optional[str] = None
+    png_path: Optional[str] = None
+    for folder in _app_icon_search_dirs():
+        if ico_path is None and os.path.isfile(os.path.join(folder, f"{app_name}.ico")):
+            ico_path = os.path.join(folder, f"{app_name}.ico")
+        if png_path is None and os.path.isfile(os.path.join(folder, f"{app_name}.png")):
+            png_path = os.path.join(folder, f"{app_name}.png")
+    return ico_path, png_path
+
+
+def _set_windows_app_user_model_id(app_id: str) -> None:
+    """Give the process its own taskbar identity so Windows shows the app icon."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(str(app_id))
+    except Exception:
+        pass
+
+
+def _apply_app_icon(app: QApplication) -> None:
+    """Use the application icon for all windows, the taskbar and dialogs."""
+    ico_path, png_path = _find_app_icon_files("ringclim")
+    icon_path = (ico_path if os.name == "nt" else None) or png_path or ico_path
+    if not icon_path:
+        return
+    try:
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(icon_path))
+    except Exception:
+        pass
+
+
+def _apply_modern_style(app: QApplication) -> None:
+    """Apply the Fusion style, a light palette and the application stylesheet."""
+    try:
+        app.setStyle("Fusion")
+    except Exception:
+        pass
+    try:
+        pal = QPalette()
+        pal.setColor(QPalette.Window, QColor("#f3f5f9"))
+        pal.setColor(QPalette.WindowText, QColor("#1f2937"))
+        pal.setColor(QPalette.Base, QColor("#ffffff"))
+        pal.setColor(QPalette.AlternateBase, QColor("#f8fafc"))
+        pal.setColor(QPalette.Text, QColor("#1f2937"))
+        pal.setColor(QPalette.Button, QColor("#ffffff"))
+        pal.setColor(QPalette.ButtonText, QColor("#1f2937"))
+        pal.setColor(QPalette.Highlight, QColor("#2563eb"))
+        pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+        pal.setColor(QPalette.ToolTipBase, QColor("#1f2937"))
+        pal.setColor(QPalette.ToolTipText, QColor("#ffffff"))
+        pal.setColor(QPalette.Link, QColor("#2563eb"))
+        app.setPalette(pal)
+    except Exception:
+        pass
+    try:
+        app.setStyleSheet(RINGCLIM_STYLESHEET)
+    except Exception:
+        pass
+    try:
+        clipboard_filter = _ItemViewClipboardFilter(app)
+        app.installEventFilter(clipboard_filter)
+        app._ringclim_clipboard_filter = clipboard_filter
+    except Exception:
+        pass
+
+
+def _copy_item_view_selection(
+    view: QAbstractItemView,
+    with_headers: bool = False,
+    whole_view: bool = False,
+) -> None:
+    """Copy selected cells (or the whole view) of a table/list/tree as tab-separated text."""
+    model = view.model()
+    if model is None:
+        return
+    if whole_view:
+        indexes = [
+            model.index(r, c)
+            for r in range(model.rowCount())
+            for c in range(model.columnCount())
+        ]
+    else:
+        sel = view.selectionModel()
+        indexes = list(sel.selectedIndexes()) if sel is not None else []
+        if not indexes:
+            cur = view.currentIndex()
+            indexes = [cur] if cur.isValid() else []
+    if not indexes:
+        return
+
+    def _cell_text(idx: QModelIndex) -> str:
+        value = idx.data(Qt.DisplayRole)
+        return "" if value is None else str(value)
+
+    lines: List[str] = []
+    if isinstance(view, QTableView):
+        rows = sorted({i.row() for i in indexes})
+        cols = sorted({i.column() for i in indexes})
+        lookup = {(i.row(), i.column()): i for i in indexes}
+        if with_headers:
+            lines.append(
+                "\t".join(
+                    str(model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "")
+                    for c in cols
+                )
+            )
+        for r in rows:
+            lines.append(
+                "\t".join(
+                    _cell_text(lookup[(r, c)]) if (r, c) in lookup else ""
+                    for c in cols
+                )
+            )
+    else:
+        indexes = sorted(indexes, key=lambda i: (view.visualRect(i).top(), i.column()))
+        lines = [_cell_text(i) for i in indexes]
+    QGuiApplication.clipboard().setText("\n".join(lines))
+
+
+class _ItemViewClipboardFilter(QObject):
+    """Application-wide Ctrl+C / Ctrl+A / context menu support for lists, tables and trees."""
+
+    @staticmethod
+    def _is_copy_key(event) -> bool:
+        if event.matches(QKeySequence.Copy):
+            return True
+        ctrl = bool(event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier))
+        if not ctrl:
+            return False
+        if event.key() == Qt.Key_C:
+            return True
+        try:
+            return sys.platform.startswith("win") and int(event.nativeVirtualKey()) == 0x43
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_select_all_key(event) -> bool:
+        if event.matches(QKeySequence.SelectAll):
+            return True
+        ctrl = bool(event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier))
+        if not ctrl:
+            return False
+        try:
+            return sys.platform.startswith("win") and int(event.nativeVirtualKey()) == 0x41
+        except Exception:
+            return False
+
+    def eventFilter(self, obj, event):
+        try:
+            etype = event.type()
+        except Exception:
+            return False
+        if etype == QEvent.KeyPress and isinstance(obj, QAbstractItemView):
+            if self._is_copy_key(event):
+                _copy_item_view_selection(
+                    obj,
+                    with_headers=bool(event.modifiers() & Qt.ShiftModifier),
+                )
+                return True
+            if self._is_select_all_key(event):
+                obj.selectAll()
+                return True
+            return False
+        if etype == QEvent.ContextMenu:
+            view = obj.parent() if isinstance(obj, QWidget) else None
+            if isinstance(view, QAbstractItemView) and obj is view.viewport():
+                # Tables with a custom context menu own this event (for example,
+                # the download table's retry/pause menu). Let Qt emit their
+                # customContextMenuRequested signal instead of showing Copy.
+                if (view.contextMenuPolicy() == Qt.CustomContextMenu
+                        or obj.contextMenuPolicy() == Qt.CustomContextMenu):
+                    return False
+                menu = QMenu(view)
+                act_copy = menu.addAction("Copy")
+                act_copy.setShortcut(QKeySequence.Copy)
+                act_copy_hdr = None
+                if isinstance(view, QTableView):
+                    act_copy_hdr = menu.addAction("Copy with headers")
+                    act_copy_hdr.setShortcut(QKeySequence("Ctrl+Shift+C"))
+                act_copy_all = menu.addAction("Copy whole table" if isinstance(view, QTableView) else "Copy all")
+                menu.addSeparator()
+                act_select_all = menu.addAction("Select all")
+                act_select_all.setShortcut(QKeySequence.SelectAll)
+                chosen = menu.exec(event.globalPos())
+                if chosen is act_copy:
+                    _copy_item_view_selection(view)
+                elif act_copy_hdr is not None and chosen is act_copy_hdr:
+                    _copy_item_view_selection(view, with_headers=True)
+                elif chosen is act_copy_all:
+                    _copy_item_view_selection(view, with_headers=True, whole_view=True)
+                elif chosen is act_select_all:
+                    view.selectAll()
+                return True
+        return False
+
+
+HELP_CSS = """
+<style>
+body { font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; color: #1f2937; }
+h1 { color: #1d4ed8; font-size: 20pt; margin-bottom: 2px; }
+h2 { color: #1e3a8a; font-size: 14pt; margin-top: 16px; margin-bottom: 4px; }
+h3 { color: #374151; font-size: 11pt; margin-top: 10px; margin-bottom: 2px; }
+p { margin-top: 3px; margin-bottom: 3px; }
+li { margin-bottom: 2px; }
+code { background-color: #eef1f6; color: #0f172a; font-family: Consolas, 'Courier New', monospace; }
+.kbd { background-color: #eef1f6; font-family: Consolas, 'Courier New', monospace; font-weight: 600; }
+.note { background-color: #eef4ff; }
+table.grid { border-collapse: collapse; }
+table.grid td, table.grid th { border: 1px solid #d5dce8; padding: 3px 8px; }
+table.grid th { background-color: #eef2f7; }
+a { color: #2563eb; text-decoration: none; }
+</style>
+"""
+
+
+def _show_html_help_dialog(
+    parent: Optional[QWidget],
+    title: str,
+    body_html: str,
+    width: int = 900,
+    height: int = 680,
+    anchor: str = "",
+) -> None:
+    """Show a modern, searchable, copyable HTML help dialog."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.resize(width, height)
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(10, 10, 10, 10)
+    lay.setSpacing(8)
+
+    browser = QTextBrowser()
+    browser.setOpenExternalLinks(False)
+    browser.setOpenLinks(True)
+    browser.setHtml(HELP_CSS + body_html)
+    lay.addWidget(browser, 1)
+
+    row = QHBoxLayout()
+    row.addWidget(QLabel("Find:"))
+    edit_find = QLineEdit()
+    edit_find.setPlaceholderText("Type a word and press Enter")
+    edit_find.setClearButtonEnabled(True)
+    row.addWidget(edit_find, 1)
+    btn_find = QPushButton("Find next")
+    btn_copy = QPushButton("Copy all")
+    btn_close = QPushButton("Close")
+    row.addWidget(btn_find)
+    row.addSpacing(12)
+    row.addWidget(btn_copy)
+    row.addWidget(btn_close)
+    lay.addLayout(row)
+
+    def _find_next() -> None:
+        needle = edit_find.text().strip()
+        if not needle:
+            return
+        if not browser.find(needle):
+            cursor = browser.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            browser.setTextCursor(cursor)
+            browser.find(needle)
+
+    edit_find.returnPressed.connect(_find_next)
+    btn_find.clicked.connect(_find_next)
+    btn_copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(browser.toPlainText()))
+    btn_close.clicked.connect(dlg.accept)
+    btn_find.setToolTip("Jump to the next match of the search text.")
+    btn_copy.setToolTip("Copy the whole help text to the clipboard.")
+    if anchor:
+        QTimer.singleShot(0, lambda: browser.scrollToAnchor(anchor))
+    dlg.exec()
+
+
+RINGCLIM_HELP_HTML = """
+<h1>Ring-Climate Analyzer (RingClim) &ndash; Help</h1>
+<p>Correlates tree-ring chronologies with monthly or daily climate data (or with other chronologies),
+shows ranked results with plots and exports tables, windows, merged data and reports.</p>
+<p class="note">&nbsp;Tip: use the <b>Find</b> box below. Every table, list and text field supports
+<span class="kbd">Ctrl+C</span>, <span class="kbd">Ctrl+A</span> and a right-click menu.
+<span class="kbd">F1</span> opens this help.&nbsp;</p>
+<p><b>Contents:</b> <a href="#quick">Quick start</a> &middot; <a href="#data">Data tab</a> &middot;
+<a href="#import">Import dialog</a> &middot; <a href="#grid">Large gridded data</a> &middot;
+<a href="#prefill">Import from Detrend Advisor</a> &middot; <a href="#analysis">Analysis tab</a> &middot;
+<a href="#results">Results tab</a> &middot; <a href="#report">Report tab</a> &middot;
+<a href="#windows">Window names</a> &middot; <a href="#keys">Keyboard and mouse</a> &middot;
+<a href="#status">Status bar and settings</a></p>
+
+<a name="quick"></a><h2>1. Quick start</h2>
+<ol>
+<li><b>Data</b> tab: import chronologies and climate files (<i>Add / Import File</i> or <i>Add multiple files</i>).</li>
+<li><b>Analysis</b> tab: select chronologies (A) and climate datasets (right list), set years and windows.</li>
+<li>Press <b>Run analysis</b>. Results open automatically in the <b>Results</b> tab.</li>
+<li>Click a result row to see its plots; use <b>Export</b> in Results or <b>Export report</b> in Report.</li>
+</ol>
+
+<a name="data"></a><h2>2. Data tab</h2>
+<table class="grid">
+<tr><th>Button</th><th>What it does</th></tr>
+<tr><td>Add / Import File</td><td>Import one file (CSV, TXT, PRN, XLS, XLSX). Excel files with several sheets let you choose sheets.
+Special formats are detected automatically (GRDC monthly and daily/hourly discharge, combined station tables).</td></tr>
+<tr><td>Add multiple files</td><td>Batch import. After the first file you can let the program reuse the detected layout for identical files;
+files that cannot be recognised confidently can be reviewed manually or skipped. A summary lists manual, automatic,
+empty and skipped files.</td></tr>
+<tr><td>Large gridded data...</td><td>Extract a point or area time series from a NetCDF grid (see section 4).</td></tr>
+<tr><td>Remove Selected</td><td>Remove the selected datasets from the project (multi-selection allowed).</td></tr>
+<tr><td>Edit Selected</td><td>Reopen the import dialog for the selected dataset to change layout, columns, names or climate type.</td></tr>
+<tr><td>Save project</td><td>Save all datasets and their metadata to a JSON project file.</td></tr>
+<tr><td>Load project</td><td>Open a project. If datasets are already loaded you choose <i>Open new (replace)</i> or <i>Merge into current</i>.</td></tr>
+<tr><td>Add project</td><td>Merge another project into the current session (duplicate names get a number).</td></tr>
+</table>
+<ul>
+<li><b>Loaded datasets</b> list: shows name, type and period. <b>Double-click</b> an entry to preview its table
+(daily/hourly series are shown as monthly or daily wide tables depending on the Resolution in the Analysis tab).</li>
+<li>Dataset kinds: <i>chronology</i> (Year + series), <i>climate</i> (Year + 12 months), <i>timeseries</i> (DateTime + value, daily/hourly).</li>
+</ul>
+
+<a name="import"></a><h2>3. Import dialog (File Import &ndash; Column mapping)</h2>
+<p>The current file is shown at the top; the left table previews the first 100 rows with the current settings.
+After opening, the layout is detected automatically and you are asked whether a manual review is needed.</p>
+<ul>
+<li><b>Data layout</b>: <i>Year + 12 month columns</i> (wide), <i>Year + Month + Value</i> (stacked),
+<i>Year + multiple series columns</i> (chronologies), <i>Date + Value (monthly)</i>.</li>
+<li><b>Climate variable type</b>: temperature (mean/min/max), precipitation, runoff, soil moisture, snow, PDSI,
+humidity, pressure, wind, radiation, other. Guessed from file name, headers and comments; defines the default
+aggregation (sum for precipitation/runoff/snow/radiation, mean for the others).</li>
+<li><b>Select Year column</b>, <b>12 month columns</b> (wide), <b>Month + Value</b> (stacked), <b>Date + Value</b> (date-based).</li>
+<li><b>Multiple series</b>: select value columns, or tick <i>Import only a single selected series</i>.</li>
+<li><b>Decimal separator</b>: Auto, Dot or Comma (for values like 1,23).</li>
+<li><b>File has header row</b>, <b>Skip top rows</b> (metadata), <b>Treat lines starting with '#' as comments</b>.</li>
+<li><b>Edit / Filter Columns</b>: keep/drop columns (Select all, Clear selection), rename a column
+(Apply rename to selected) and <i>Apply quick suggestions</i> (Year, Chronology, Jan..Dec).</li>
+<li><b>Auto-detect layout &amp; suggestions</b>: prefill layout and columns for common formats.</li>
+<li><b>Auto-detect and apply column names</b>: detect and rename in one step.</li>
+<li>Month headers accepted: Jan..Dec, Russian short names, Roman numerals I..XII, Y1..Y12, 1..12.
+Values such as -999 are treated as missing.</li>
+</ul>
+
+<a name="grid"></a><h2>4. Large gridded data (NetCDF)</h2>
+<ul>
+<li><b>File / Browse...</b>: *.nc, *.nc.gz, *.dat.nc (e.g. CRU TS). Requires <code>xarray</code> and <code>netCDF4</code>.</li>
+<li><b>Target lat / lon</b>: point of interest. Without a manual box the value is bilinearly interpolated from the
+nearest cells (automatic box of &plusmn;10&deg;).</li>
+<li><b>Specify bounding box manually</b>: Min/Max lat/lon; the result is the latitude-weighted mean of all cells in the box.</li>
+<li><b>Source / Target frequency</b> and <b>Aggregation</b> (mean or sum) for resampling (hourly/daily to monthly).</li>
+<li><b>Climate parameter type</b> and <b>Use only years</b> (limit the period; <i>Available period</i> is shown after preview).</li>
+<li><b>Preview / auto-detect</b>: read metadata, detect frequency, variable type and period, show the first rows.</li>
+<li><b>Run extraction</b> (runs in the background), <b>Export...</b> (Excel with a <i>meta</i> sheet or CSV + meta.txt),
+<b>Add to project</b>, <b>Close</b>. The log shows interpolation method and number of cells used.</li>
+</ul>
+
+<a name="prefill"></a><h2>5. Import from Detrend Advisor</h2>
+<p>When RingClim is opened from Detrend Advisor (<code>--prefill manifest.json</code>) you can <i>Include all</i> datasets or
+<i>Select...</i> them. Selection buttons: <b>Select all</b>, <b>Chronologies only</b>, <b>STD only</b>, <b>RES only</b>,
+<b>POWT only</b>, <b>Exclude POWT</b>, <b>Top 3 recommended (per dataset)</b>, <b>Select none</b>.
+Items are grouped by dataset and method.</p>
+
+<a name="analysis"></a><h2>6. Analysis tab</h2>
+<h3>Top row</h3>
+<ul>
+<li><b>Correlation target</b>: <i>Chronology &times; Climate</i> or <i>Chronology &times; Chronology</i> (full-period series correlation).</li>
+<li><b>Resolution</b>: <i>Monthly</i> (monthly windows, previous and current year) or <i>Daily</i>
+(same-year rolling day windows from daily/hourly datasets).</li>
+<li><b>Select all</b> selects the right-hand list; <b>Clear selection</b> clears both lists.</li>
+<li><b>Minimum years per correlation (n)</b>: windows with fewer common years are skipped (default 15).</li>
+<li><b>Preview selected dataset</b>: preview exactly one selected dataset.</li>
+<li><b>Run analysis</b>: compute all correlations.</li>
+</ul>
+<h3>Data selection</h3>
+<ul>
+<li><b>Chronologies (A)</b> and <b>Climate / daily-hourly datasets</b> (or <b>Chronologies (B)</b>). Double-click to preview.</li>
+<li><b>Daily/hourly &rarr; monthly</b> (or <b>Hourly &rarr; daily base agg</b> in Daily mode): Auto, sum or mean;
+<b>Preview selected ...</b> shows the table that will actually be used.</li>
+<li>The label below lists the period of each selected dataset and, if enabled, the common period.</li>
+</ul>
+<h3>Analysis parameters</h3>
+<ul>
+<li><b>Year start / Year end</b>; <b>Use common period for selected datasets</b> sets the overlapping years
+(if there is no overlap you may keep all datasets or exclude the conflicting ones).</li>
+<li><b>Min / Max window length</b> (months, 1&ndash;24; days in Daily mode).</li>
+<li><b>Aggregation</b>: <i>Auto (by variable)</i>, <i>sum</i>, <i>mean</i>, <i>sum/2</i> (default aggregation &times; 0.5), <i>both</i>.</li>
+<li><b>Show only top N correlations</b> + mode <i>Overall</i> or <i>Per pair</i> (0 = show all).</li>
+<li><b>Report: top K rows per pair</b> (0 = 10).</li>
+<li><b>Exclude single-month windows</b>.</li>
+<li><b>Multi-year period analysis</b>: <i>Minimal period span</i>, <i>Step</i>, <i>Minimal data points</i> and mode:
+<i>Anchored</i> (trim start or end by the step), <i>Sliding fixed length</i>, <i>Exhaustive grid</i> (slow, max 5000 intervals).</li>
+<li><b>Correlation method</b>: Pearson or Spearman (p-values need <code>scipy</code>; significance at p &lt; 0.05).</li>
+<li><b>Missing values (climate)</b>: <i>Ignore</i> (use available months), <i>Strict</i> (window with a gap = missing),
+<i>Fill with monthly mean</i>, <i>Local window mean (&plusmn;K years)</i>, <i>Linear interpolation (gap &le; N years)</i>.</li>
+<li><b>Season filter</b>: All months, Apr&ndash;Sep, Oct&ndash;Mar or Custom (start/end month); only windows fully inside are kept.</li>
+</ul>
+
+<a name="results"></a><h2>7. Results tab</h2>
+<ul>
+<li><b>Show</b>: <i>Main correlations</i> or <i>Period correlations</i>.</li>
+<li>Columns: Chronology, Chron_Column, Climate, (Target_Column), Window, Agg, R, p, N, Significant, Annot
+(periods add PeriodStart, PeriodEnd, PeriodMode).</li>
+<li>Click a row: upper plot = strongest windows of this pair (red = significant, blue = not significant);
+lower plot = heatmap of R by window start and length, or a series overlay for chronology &times; chronology.</li>
+<li><b>Export</b>: <i>Export results</i> (Excel with sheets All / Top filtered / Periods, or CSV files),
+<i>Export climate windows...</i> (one or all climate datasets), <i>Export merged data for selected result</i>
+(chronology + windows), <i>Save plot PNG</i> (300 dpi).</li>
+</ul>
+
+<a name="report"></a><h2>8. Report tab</h2>
+<ul>
+<li>Top K correlations for every chronology &times; target pair. <b>Export report</b> saves it as Excel or CSV.</li>
+</ul>
+
+<a name="spatial"></a><h2>8a. Spatial correlation</h2>
+<p><b>Spatial correlation...</b> (Data or Results tab) opens a page that correlates a chronology with a climate window
+in every grid cell of a region (CRU TS, GPCC, TerraClimate, scPDSI, SPEIbase, ERA5/ERA5-Land with your key, or a local
+NetCDF file), like the KNMI Climate Explorer. Its <i>Results summary</i> systematises the last correlation table
+(strongest chronology, variable types, recurring months, top pairs) and <i>Suggested maps</i> turns the strongest
+windows into ready settings: double-click a suggestion to draw the map with the site marked. Click a cell to compare
+its series with the chronology. Chronologies without coordinates: type them or pick the site on the map.</p>
+<p>Online data and Spatial correlation open as tabs of this window; <b>Detach to window</b> moves a page to its own
+window (e.g. to a second monitor), closing that window puts it back as a tab.</p>
+<p><b>Screen all windows for this region</b> correlates the chronology with every window of months (1-12 or 1-24
+months) of every ticked variable (e.g. CRU TS tmp, tmn, tmx, pre, pet, vap) and ranks them by the significant area
+(same sign as at the site) that is connected with the site - a coherent regional signal, as recommended for the KNMI
+Climate Explorer. Significance can account for serial correlation (effective n). <i>Shuffles</i> repeat the whole
+screening with shuffled chronology years: <i>p (shuffled)</i> below 0.05 means such an area is unlikely by chance.
+Double-click a row to draw its map.</p>
+<a name="moving"></a><h2>8b. Moving correlation (temporal stability)</h2>
+<p><b>Moving correlation...</b> (Data or Results tab) correlates the ticked chronologies with one climate season in a
+window of <i>w</i> years (default 25) moved one year at a time; each r is drawn at the centre year of its window, with
+dashed (p &lt; 0.01) and dotted (p &lt; 0.05) significance lines, one panel per data set or per column (e.g.
+TRW/EWBI/LWBI/DBI or STD/RES). <i>Suggest from results</i> picks the strongest season of the analysis. The table
+<i>Stability statistics</i> gives the share of significant windows, min/max, the r of both halves of the period with
+Fisher's z test, the year from which the correlation changes most and a verdict (stable / weakening / strengthening /
+unstable). Optional bootstrap 95% bands; the linear trend of the climate is removed by default.</p>
+<p><b>Screen all seasons x all climate data</b> (Moving correlation page) computes the running correlations of every
+ticked chronology with every monthly climate dataset and every window of months (1-12 or 1-24) and lists the most
+stable signals per chronology: share of running windows with p &lt; 0.05 (same sign), mean, min and max r, the r of
+both halves and a verdict. <i>Shuffles</i> repeat the whole screening with shuffled chronology years; <i>p
+(shuffled)</i> below 0.05 means the stability is unlikely to be chance among so many combinations. Double-click a row
+or use <i>Plot the top rows</i>. The screenings are saved with the project.</p>
+<a name="windows"></a><h2>9. Window names</h2>
+<ul>
+<li><code>pJan..pDec</code> = months of the previous year, <code>Jan..Dec</code> = current year.</li>
+<li><code>pMay_Aug</code> = May of previous year to August of current year; suffix <code>_sum</code>/<code>_mean</code> in exports.</li>
+<li>Daily mode: <code>Jan01..Dec31</code> (+ <code>Feb29</code>), e.g. <code>May01_May14</code>.</li>
+</ul>
+
+<a name="keys"></a><h2>10. Keyboard and mouse</h2>
+<table class="grid">
+<tr><th>Keys</th><th>Action</th></tr>
+<tr><td><span class="kbd">Ctrl+C</span></td><td>Copy selected cells/rows (tab-separated, paste into Excel)</td></tr>
+<tr><td><span class="kbd">Ctrl+Shift+C</span></td><td>Copy selected table cells with column headers</td></tr>
+<tr><td><span class="kbd">Ctrl+A</span></td><td>Select all</td></tr>
+<tr><td>Right click</td><td>Copy, Copy with headers, Copy whole table, Select all</td></tr>
+<tr><td><span class="kbd">F1</span></td><td>Open this help</td></tr>
+</table>
+
+<a name="status"></a><h2>11. Status bar and settings</h2>
+<ul>
+<li><b>UI scale</b>: enlarge or shrink the interface. <b>Cite</b>, <b>Help</b> (F1), <b>About</b>.</li>
+<li>Settings (window size, folders, analysis options, UI scale) are saved in <code>~/.ringclim_settings.json</code>.</li>
+<li>Import problems of the EXE build are written to <code>ringclim_import_debug.log</code> in the temp folder.</li>
+</ul>
+"""
+
+
+IMPORT_HELP_HTML = """
+<h1>Import help</h1>
+<p>This dialog defines how a file becomes a chronology, a monthly climate dataset or a time series.</p>
+<h2>Recommended steps</h2>
+<ol>
+<li>Check the preview. If it is wrong, first adjust <b>File has header row</b>, <b>Skip top rows</b> and
+<b>Treat lines starting with '#' as comments</b>.</li>
+<li>Press <b>Auto-detect layout &amp; suggestions</b> (or <b>Auto-detect and apply column names</b>).</li>
+<li>Check the <b>Data layout</b> and the selected columns; fix them manually if needed.</li>
+<li>For climate data choose the <b>Climate variable type</b>; it defines the default aggregation.</li>
+<li>Press <b>OK</b>. If the mapping is invalid the dialog reopens for the same file.</li>
+</ol>
+<h2>Controls</h2>
+<ul>
+<li><b>Year + 12 month columns (wide)</b>: select the Year column and exactly 12 month columns in order.</li>
+<li><b>Year + Month + Value (stacked)</b>: Month may be 1..12, Jan..Dec or Russian short names.</li>
+<li><b>Year + multiple series columns</b>: select value columns (Ctrl+click) or import a single series.</li>
+<li><b>Date + Value (monthly)</b>: YYYY-MM or YYYY-MM-DD; values are averaged per month.</li>
+<li><b>Decimal separator</b>: Auto, Dot (.) or Comma (,).</li>
+<li><b>Edit / Filter Columns</b>: keep/drop and rename columns; <i>Apply quick suggestions</i> proposes Year/Jan..Dec names.</li>
+</ul>
+<h2>Automatically recognised formats</h2>
+<ul>
+<li><b>Chronology</b>: Year + one or more series.</li>
+<li><b>Monthly climate</b>: Year + 12 months, also with station metadata columns before Year.</li>
+<li><b>Combined station table</b> (Country / Code_WMO / Name / year / jan..dec): one dataset per station,
+named <code>Name (Code_Country)</code>.</li>
+<li><b>GRDC</b> mean monthly discharge and daily/hourly discharge; empty GRDC files are skipped.</li>
+<li>Missing value codes such as -999 are treated as missing.</li>
+</ul>
+<h2>Batch import</h2>
+<ul>
+<li>If you accept the detected settings without review, identical files are imported automatically.</li>
+<li>Files that do not match confidently can be reviewed manually or skipped.</li>
+</ul>
+"""
+
+
 class MplCanvas(FigureCanvas):
     def __init__(self, parent: Optional[QWidget] = None):
         fig = Figure(figsize=(6, 4))
@@ -2053,43 +3287,33 @@ class DataSet:
     def _init_metadata(self):
         cols = list(self.df.columns)
         # guess year column
-        for cand in ["Year", "year", "YEAR", "Год", "год", "Year_1", "col_1"]:
-            if cand in cols:
+        for cand in cols:
+            if _looks_like_year_column_name(cand):
                 self.year_col = cand
                 break
         if self.kind == "chronology":
             self.value_columns = [c for c in cols if c != self.year_col]
         elif self.kind == "climate":
-            month_candidates: list[str] = []
+            month_candidates: list[tuple[int, str]] = []
 
             for c in cols:
                 if not c:
                     continue
-                cl = c.lower()
-
-                # explicit English/Russian months
-                if cl in (
-                    "jan", "feb", "mar", "apr", "may", "jun",
-                    "jul", "aug", "sep", "oct", "nov", "dec",
-                    "янв", "фев", "мар", "апр", "май", "июн",
-                    "июл", "авг", "сен", "окт", "ноя", "дек",
-                ):
-                    month_candidates.append(c)
-                    continue
-
-                # old style: Y1..Y12, but NOT "Year"
-                cu = c.upper()
-                if cu.startswith("Y") and c not in ("Year", "YEAR"):
-                    # try to extract the number after 'Y'
-                    num_part = cu[1:]
-                    if num_part.isdigit():
-                        idx = int(num_part)
-                        if 1 <= idx <= 12:
-                            month_candidates.append(c)
+                canonical = _normalize_month_header_token(c)
+                if canonical is not None:
+                    month_candidates.append((MONTH_NAMES.index(canonical), c))
 
             if len(month_candidates) >= 12:
-                # keep order as is
-                self.month_columns = month_candidates[:12]
+                # Keep one column per month in calendar order.
+                month_candidates.sort(key=lambda x: x[0])
+                seen_months: set[int] = set()
+                ordered_cols: list[str] = []
+                for month_idx, col_name in month_candidates:
+                    if month_idx in seen_months:
+                        continue
+                    seen_months.add(month_idx)
+                    ordered_cols.append(col_name)
+                self.month_columns = ordered_cols[:12]
             else:
                 # fallback: any 12 non-year
                 self.month_columns = [c for c in cols if c != self.year_col][:12]
@@ -2314,6 +3538,36 @@ def generate_climate_windows(
 # ---------------------------
 # Compute correlations
 # ---------------------------
+def _fast_r_p(x, y, method: str = "pearson") -> Tuple[float, float]:
+    """Pearson / Spearman r with the two-sided t-test p (same values as scipy.stats, ~50x faster)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    if n < 3:
+        return float("nan"), float("nan")
+    if method == "spearman":
+        x = pd.Series(x).rank().to_numpy()
+        y = pd.Series(y).rank().to_numpy()
+    xm = x - x.mean()
+    ym = y - y.mean()
+    den = np.sqrt(np.dot(xm, xm) * np.dot(ym, ym))
+    if not den > 0:
+        return float("nan"), float("nan")
+    r = float(np.dot(xm, ym) / den)
+    r = max(-1.0, min(1.0, r))
+    if abs(r) >= 1.0:
+        return r, 0.0
+    df = n - 2
+    t = r * np.sqrt(df / ((1.0 - r) * (1.0 + r)))
+    try:
+        from scipy.special import stdtr
+
+        p = float(2.0 * stdtr(df, -abs(t)))
+    except Exception:  # pragma: no cover
+        p = float(math.erfc(abs(t) / math.sqrt(2.0)))
+    return r, p
+
+
 def compute_correlations(
     chron_sets: List[DataSet],
     climate_sets: List[DataSet],
@@ -2336,6 +3590,7 @@ def compute_correlations(
     local_window_k: int = 5,
     interpolate_max_gap: int = 3,
     agg_resolver=None,
+    min_n: int = 3,
 ) -> pd.DataFrame:
     """
     Main correlation routine.
@@ -2370,7 +3625,7 @@ def compute_correlations(
         if corr_method == "pearson":
             if stats is not None:
                 try:
-                    r_val, p_val = stats.pearsonr(x_arr, y_arr)
+                    r_val, p_val = _fast_r_p(x_arr, y_arr, "pearson")
                 except Exception:
                     r_val = float(np.corrcoef(x_arr, y_arr)[0, 1])
                     p_val = np.nan
@@ -2379,7 +3634,7 @@ def compute_correlations(
         elif corr_method == "spearman":
             if stats is not None:
                 try:
-                    r_val, p_val = stats.spearmanr(x_arr, y_arr)
+                    r_val, p_val = _fast_r_p(x_arr, y_arr, "spearman")
                 except Exception:
                     r_val = np.nan
                     p_val = np.nan
@@ -2566,7 +3821,7 @@ def compute_correlations(
                     x_valid = x[mask].to_numpy()
                     y_valid = y[mask].to_numpy()
                     n = int(mask.sum())
-                    if n < 3:
+                    if n < max(3, int(min_n)):
                         continue
 
                     r, p = compute_r_p(x_valid, y_valid)
@@ -2667,6 +3922,7 @@ def compute_daily_timeseries_correlations(
     exclude_single: bool = False,
     base_agg_choice: str = "Auto (by variable)",
     agg_resolver=None,
+    min_n: int = 3,
     ) -> pd.DataFrame:
     """
     Compute chronology correlations against same-year daily climate windows.
@@ -2684,7 +3940,7 @@ def compute_daily_timeseries_correlations(
         if corr_method == "pearson":
             if stats is not None:
                 try:
-                    r_val, p_val = stats.pearsonr(x_arr, y_arr)
+                    r_val, p_val = _fast_r_p(x_arr, y_arr, "pearson")
                 except Exception:
                     r_val = float(np.corrcoef(x_arr, y_arr)[0, 1])
                     p_val = np.nan
@@ -2693,7 +3949,7 @@ def compute_daily_timeseries_correlations(
         elif corr_method == "spearman":
             if stats is not None:
                 try:
-                    r_val, p_val = stats.spearmanr(x_arr, y_arr)
+                    r_val, p_val = _fast_r_p(x_arr, y_arr, "spearman")
                 except Exception:
                     r_val = np.nan
                     p_val = np.nan
@@ -2822,7 +4078,7 @@ def compute_daily_timeseries_correlations(
                     x_valid = x[mask].to_numpy()
                     y_valid = y[mask].to_numpy()
                     n = int(mask.sum())
-                    if n < 3:
+                    if n < max(3, int(min_n)):
                         continue
 
                     r, p = compute_r_p(x_valid, y_valid)
@@ -2870,6 +4126,7 @@ def compute_chronology_correlations(
     min_period_points: int = 30,
     period_mode: str = "anchored",
     period_rows_out: Optional[List[Dict[str, Any]]] = None,
+    min_n: int = 3,
 ) -> pd.DataFrame:
     """
     Compute correlations between chronology series (chronology × chronology).
@@ -2894,7 +4151,7 @@ def compute_chronology_correlations(
         if corr_method == "pearson":
             if stats is not None:
                 try:
-                    r_val, p_val = stats.pearsonr(x_arr, y_arr)
+                    r_val, p_val = _fast_r_p(x_arr, y_arr, "pearson")
                 except Exception:
                     r_val = float(np.corrcoef(x_arr, y_arr)[0, 1])
                     p_val = np.nan
@@ -2903,7 +4160,7 @@ def compute_chronology_correlations(
         elif corr_method == "spearman":
             if stats is not None:
                 try:
-                    r_val, p_val = stats.spearmanr(x_arr, y_arr)
+                    r_val, p_val = _fast_r_p(x_arr, y_arr, "spearman")
                 except Exception:
                     r_val = pd.Series(x_arr).corr(pd.Series(y_arr), method="spearman")
                     p_val = np.nan
@@ -2976,7 +4233,7 @@ def compute_chronology_correlations(
                 cols_b = [c for c in b.value_columns if c in b.df.columns and c != b.year_col]
 
                 for col_b in cols_b:
-                    for col_b in b.value_columns:
+                    for col_b in [col_b]:  # (a second loop over all columns duplicated every row)
                         if a is b and col_a == col_b:
                             continue
 
@@ -3032,7 +4289,7 @@ def compute_chronology_correlations(
                         y = _to_numeric_1d(merged[y_col])
                         mask = ~np.isnan(x) & ~np.isnan(y)
                         n = int(mask.sum())
-                        if n < 3:
+                        if n < max(3, int(min_n)):
                             continue
 
                         years_valid = merged["Year"].to_numpy(dtype=float)[mask]
@@ -3130,6 +4387,260 @@ def compute_chronology_correlations(
             lambda r: f"{r['R']:.3f}" + (" *" if r["Significant"] else ""), axis=1
         )
     return df_res
+
+
+# ---------------------------
+# Parallel correlation screening (one task per chronology x dataset pair)
+# ---------------------------
+class _AggResolver:
+    """Picklable version of the aggregation choice (used in worker processes)."""
+
+    def __init__(self, choice: str) -> None:
+        self.choice = choice
+
+    def __call__(self, cset, col_name, clim_ds):
+        choice = self.choice
+        if choice == "both":
+            return ["sum", "mean"], 1.0
+        if choice == "Auto (by variable)":
+            return [get_default_agg_for_param(getattr(clim_ds, "climate_param", "Other"))], 1.0
+        if choice in ("sum", "mean"):
+            return [choice], 1.0
+        if choice == "sum/2":
+            return [get_default_agg_for_param(getattr(clim_ds, "climate_param", "Other"))], 0.5
+        return [choice], 1.0
+
+
+def _corr_pair_task(kind: str, cset, rset, kwargs: Dict[str, Any]):
+    """Worker: correlations of one chronology data set with one climate / target data set."""
+    periods: List[Dict[str, Any]] = []
+    if kind == "monthly":
+        df = compute_correlations(chron_sets=[cset], climate_sets=[rset], period_rows_out=periods, **kwargs)
+    elif kind == "daily":
+        df = compute_daily_timeseries_correlations(chron_sets=[cset], timeseries_sets=[rset], **kwargs)
+    else:
+        df = compute_chronology_correlations(chron_sets_a=[cset], chron_sets_b=[rset], period_rows_out=periods,
+                                             **kwargs)
+    return df, periods
+
+
+def system_resources() -> Dict[str, float]:
+    """Logical CPUs and available / total memory (MB) of this computer."""
+    cpu = os.cpu_count() or 1
+    avail = total = 0.0
+    try:
+        import psutil  # type: ignore
+
+        vm = psutil.virtual_memory()
+        avail, total = vm.available / 2 ** 20, vm.total / 2 ** 20
+    except Exception:
+        try:
+            if sys.platform == "win32":
+                import ctypes
+
+                class _MS(ctypes.Structure):
+                    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+                ms = _MS()
+                ms.dwLength = ctypes.sizeof(_MS)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+                avail, total = ms.ullAvailPhys / 2 ** 20, ms.ullTotalPhys / 2 ** 20
+            elif sys.platform == "darwin":
+                import subprocess as _sp
+
+                total = int(_sp.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout) / 2 ** 20
+                vm = _sp.run(["vm_stat"], capture_output=True, text=True).stdout
+                page = 4096
+                m = re.search(r"page size of (\d+)", vm)
+                if m:
+                    page = int(m.group(1))
+                free = sum(int(x) for x in re.findall(r"Pages (?:free|inactive|speculative|purgeable):\s+(\d+)", vm))
+                avail = free * page / 2 ** 20
+            else:
+                pages = os.sysconf("SC_AVPHYS_PAGES")
+                size = os.sysconf("SC_PAGE_SIZE")
+                avail = pages * size / 2 ** 20
+                total = os.sysconf("SC_PHYS_PAGES") * size / 2 ** 20
+        except Exception:
+            pass
+    return {"cpu": float(cpu), "mem_avail_mb": float(avail), "mem_total_mb": float(total)}
+
+
+def safe_worker_count(n_tasks: int, requested: int = 0, per_worker_mb: float = 450.0,
+                      data_mb: float = 0.0) -> int:
+    """How many worker processes can run at the same time without slowing the computer down.
+
+    One logical CPU is left for the window and the system; every worker needs about ``per_worker_mb``
+    (Python + numpy/pandas/scipy) plus its copy of the data; 1.5 GB of memory stays free.
+    """
+    res = system_resources()
+    cpu = int(res["cpu"])
+    by_cpu = max(1, cpu - 1)
+    if res["mem_avail_mb"] > 0:
+        by_mem = int((res["mem_avail_mb"] - 1536.0) // (per_worker_mb + data_mb))
+    else:
+        by_mem = 4
+    limit = max(1, min(by_cpu, by_mem, 61))  # 61 = Windows limit of ProcessPoolExecutor
+    if requested and requested > 0:
+        limit = max(1, min(int(requested), by_cpu + 1, 61))
+    return max(1, min(limit, int(n_tasks)))
+
+
+class AnalysisControl:
+    """Progress and cancel state shared between the GUI and the analysis."""
+
+    def __init__(self) -> None:
+        import threading as _th
+
+        self.cancel = _th.Event()
+        self.done = 0
+        self.total = 0
+        self.workers = 1
+        self.note = ""
+
+
+def run_correlation_tasks(kind: str, chron_sets: List["DataSet"], right_sets: List["DataSet"],
+                          kwargs: Dict[str, Any], workers: int = 0,
+                          ctl: Optional[AnalysisControl] = None, pairs: Optional[List[Tuple[Any, Any]]] = None,
+                          per_pair_out: Optional[List[Any]] = None) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """All chronology x data-set pairs (or the given ``pairs``); in parallel worker processes when it pays off.
+
+    ``per_pair_out`` receives (chronology, dataset, df, periods) of every pair (for re-use later).
+    """
+    ctl = ctl or AnalysisControl()
+    tasks = list(pairs) if pairs is not None else [(c, r) for c in chron_sets for r in right_sets]
+    if not tasks:
+        return pd.DataFrame(), []
+    ctl.total = len(tasks)
+    results: Dict[int, Tuple[pd.DataFrame, List[Dict[str, Any]]]] = {}
+    try:
+        data_mb = max(float(r.df.memory_usage(deep=True).sum()) for _c, r in tasks) / 2 ** 20 * 3
+    except Exception:
+        data_mb = 0.0
+    n_proc = safe_worker_count(len(tasks), workers, data_mb=data_mb)
+    use_pool = n_proc > 1 and len(tasks) >= 3
+    ctl.workers = n_proc if use_pool else 1
+
+    def sequential(indices) -> None:
+        for k in indices:
+            if ctl.cancel.is_set():
+                raise _AnalysisCancelled()
+            c, r = tasks[k]
+            results[k] = _corr_pair_task(kind, c, r, kwargs)
+            ctl.done = len(results)
+
+    if use_pool:
+        import concurrent.futures as cf
+        import multiprocessing as mp
+
+        try:
+            ctx = mp.get_context("spawn")
+            ex = cf.ProcessPoolExecutor(max_workers=n_proc, mp_context=ctx)
+        except Exception as exc:  # pragma: no cover
+            ctl.note = f"parallel start failed ({exc}); one process"
+            ctl.workers = 1
+            sequential(range(len(tasks)))
+            ex = None
+        if ex is not None:
+            futs = {}
+            try:
+                for k, (c, r) in enumerate(tasks):
+                    futs[ex.submit(_corr_pair_task, kind, c, r, kwargs)] = k
+                pending = set(futs)
+                while pending:
+                    if ctl.cancel.is_set():
+                        raise _AnalysisCancelled()
+                    done, pending = cf.wait(pending, timeout=0.25, return_when=cf.FIRST_COMPLETED)
+                    for f in done:
+                        results[futs[f]] = f.result()
+                    ctl.done = len(results)
+            except _AnalysisCancelled:
+                _kill_pool(ex)
+                raise
+            except Exception as exc:
+                # e.g. a worker could not start (antivirus, frozen app without freeze_support)
+                _kill_pool(ex)
+                ctl.note = f"parallel run failed ({type(exc).__name__}: {exc}); finished in one process"
+                ctl.workers = 1
+                sequential([k for k in range(len(tasks)) if k not in results])
+            else:
+                ex.shutdown(wait=True)
+    else:
+        sequential(range(len(tasks)))
+    if per_pair_out is not None:
+        for k in sorted(results):
+            per_pair_out.append((tasks[k][0], tasks[k][1], results[k][0], results[k][1]))
+    frames = [results[k][0] for k in sorted(results) if results[k][0] is not None and not results[k][0].empty]
+    periods: List[Dict[str, Any]] = []
+    for k in sorted(results):
+        periods.extend(results[k][1])
+    if not frames:
+        return pd.DataFrame(), periods
+    df = pd.concat(frames, ignore_index=True)
+    if "R" in df.columns:
+        order = df["R"].abs().sort_values(ascending=False, kind="mergesort").index
+        df = df.loc[order].reset_index(drop=True)
+    return df, periods
+
+
+def dataset_fingerprint(ds) -> str:
+    """Changes when the data, the columns or the climate type of a dataset change."""
+    import hashlib
+
+    h = hashlib.sha1()
+    h.update(str(getattr(ds, "name", "")).encode())
+    for attr in ("kind", "climate_param", "year_col", "value_columns", "month_columns", "monthly_agg", "source_freq"):
+        h.update(repr(getattr(ds, attr, None)).encode())
+    try:
+        h.update(pd.util.hash_pandas_object(ds.df, index=False).values.tobytes())
+        h.update(repr(list(ds.df.columns)).encode())
+    except Exception:
+        h.update(repr(ds.df.shape).encode())
+    return h.hexdigest()
+
+
+def settings_fingerprint(kind: str, kwargs: Dict[str, Any]) -> str:
+    items = []
+    for k in sorted(kwargs):
+        v = kwargs[k]
+        if isinstance(v, _AggResolver):
+            v = ("agg", v.choice)
+        items.append((k, repr(v)))
+    return repr((kind, items))
+
+
+def merge_pair_results(parts: List[Tuple[pd.DataFrame, List[Dict[str, Any]]]]) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    frames = [df for df, _p in parts if df is not None and not df.empty]
+    periods: List[Dict[str, Any]] = []
+    for _df, p in parts:
+        periods.extend(p or [])
+    if not frames:
+        return pd.DataFrame(), periods
+    df = pd.concat(frames, ignore_index=True)
+    if "R" in df.columns:
+        order = df["R"].abs().sort_values(ascending=False, kind="mergesort").index
+        df = df.loc[order].reset_index(drop=True)
+    return df, periods
+
+
+class _AnalysisCancelled(Exception):
+    pass
+
+
+def _kill_pool(ex) -> None:
+    try:
+        ex.shutdown(wait=False, cancel_futures=True)
+    except TypeError:  # Python < 3.9
+        ex.shutdown(wait=False)
+    for p in list(getattr(ex, "_processes", {}) .values() if getattr(ex, "_processes", None) else []):
+        try:
+            p.terminate()
+        except Exception:
+            pass
 
 
 # ---------------------------
@@ -3250,19 +4761,53 @@ class ColumnEditDialog(QDialog):
         # 13+ columns: Year + 12 months, or StationID + Year + 12 months
         elif len(cols) >= 13:
             suggestions = {}
-            # If technical names (col_1..), the file is likely headerless:
-            # The first column is Year, followed by 12 months.
-            if all(c.startswith("col_") for c in cols):
+            year_idx = None
+            for i, c in enumerate(cols):
+                if _looks_like_year_column_name(c):
+                    year_idx = i
+                    break
+
+            # First, try explicit month headers such as I..XII, Jan..Dec, Янв..Дек, Y1..Y12.
+            month_hits: list[tuple[int, str]] = []
+            for c in cols:
+                canonical = _normalize_month_header_token(c)
+                if canonical is not None:
+                    month_hits.append((MONTH_NAMES.index(canonical), c))
+
+            unique_month_indices = {idx for idx, _ in month_hits}
+            if year_idx is not None and len(unique_month_indices) >= 12:
+                suggestions[cols[year_idx]] = "Year"
+                month_hits.sort(key=lambda x: x[0])
+                seen_months: set[int] = set()
+                for month_idx, col_name in month_hits:
+                    if month_idx in seen_months:
+                        continue
+                    seen_months.add(month_idx)
+                    suggestions[col_name] = MONTH_NAMES[month_idx]
+            elif all(c.startswith("col_") for c in cols):
+                # Headerless table: first column is Year, then 12 months.
                 suggestions[cols[0]] = "Year"
                 start_idx = 1
+                for i in range(12):
+                    idx = start_idx + i
+                    if idx < len(cols):
+                        suggestions[cols[idx]] = MONTH_NAMES[i]
+            elif year_idx is not None and (year_idx + 12) < len(cols):
+                # Table with metadata columns before Year and 12 month columns after it.
+                suggestions[cols[year_idx]] = "Year"
+                start_idx = year_idx + 1
+                for i in range(12):
+                    idx = start_idx + i
+                    if idx < len(cols):
+                        suggestions[cols[idx]] = MONTH_NAMES[i]
             else:
-                # Старый случай: StationID + Year + 12 months
+                # Backward-compatible fallback.
                 suggestions[cols[1]] = "Year"
                 start_idx = 2
-            for i in range(12):
-                idx = start_idx + i
-                if idx < len(cols):
-                    suggestions[cols[idx]] = MONTH_NAMES[i]
+                for i in range(12):
+                    idx = start_idx + i
+                    if idx < len(cols):
+                        suggestions[cols[idx]] = MONTH_NAMES[i]
         # generic: if columns named col_1.., suggest Year for first numeric-looking
         else:
             for i, c in enumerate(cols):
@@ -3387,7 +4932,7 @@ class FileImportDialog(QDialog):
                 "Temperature (mean)",
                 "Temperature (min)",
                 "Temperature (max)",
-                "Temperature",          # для старых привычек
+                "Temperature",          # legacy projects
                 "Precipitation",
                 "Runoff",
                 "Soil moisture",
@@ -3397,12 +4942,27 @@ class FileImportDialog(QDialog):
                 "Sea-level pressure",
                 "Wind speed",
                 "Radiation",
+                "Diurnal temperature range",
+                "Vapour pressure",
+                "Cloud cover",
+                "PET",
+                "Wet days",
+                "Frost days",
+                "SPEI",
+                "SPI",
+                "Climatic water deficit",
+                "Actual evapotranspiration",
+                "Vapour pressure deficit",
+                "Climate moisture index",
                 "Other",
             ]
         )
 
-        # Try to pre-select parameter based on metadata comments first, then file name.
-        guess = guess_climate_param_from_metadata(self._file_path)
+        # Try to pre-select parameter: batch manifest, metadata comments, then file name.
+        _bm = batch_metadata_for_file(self._file_path)
+        guess = (_bm or {}).get("climate_param") or None
+        if not guess:
+            guess = guess_climate_param_from_metadata(self._file_path)
         if not guess:
             guess = guess_climate_param_from_name(self._file_path or "", "")
         if guess:
@@ -3785,10 +5345,10 @@ class FileImportDialog(QDialog):
                     self._has_header = False
                     return
 
-                # Excel: usually has a proper header, keep as before
+                # Excel: use an explicit engine so pandas does not guess incorrectly
                 if self._file_path.lower().endswith((".xls", ".xlsx")):
 
-                    df0 = pd.read_excel(
+                    df0 = _read_excel_robust(
                         self._file_path,
                         sheet_name=self._sheet_name,
                         header=0,
@@ -3840,7 +5400,7 @@ class FileImportDialog(QDialog):
             try:
                 if self._file_path is not None:
                     if self._file_path.lower().endswith((".xls", ".xlsx")):
-                        df0 = pd.read_excel(
+                        df0 = _read_excel_robust(
                             self._file_path,
                             sheet_name=self._sheet_name,
                             header=None,
@@ -3910,7 +5470,7 @@ class FileImportDialog(QDialog):
             else:
                 if self._file_path.lower().endswith((".xls", ".xlsx")):
                     header_arg = 0 if self._has_header else None
-                    df_new = pd.read_excel(
+                    df_new = _read_excel_robust(
                         self._file_path,
                         sheet_name=self._sheet_name,
                         header=header_arg,
@@ -3995,20 +5555,25 @@ class FileImportDialog(QDialog):
     # -----------------------
     def open_edit_columns(self):
         cols = list(self._preview_df.columns.astype(str))
-        # attempt to create prefill suggestions: if header absent, propose col_1->Year, col_2->Chronology etc.
-        prefill = {}
+        # Attempt to create prefill suggestions before opening the dialog.
+        prefill: Dict[str, str] = {}
         if len(cols) == 2:
             prefill = {cols[0]: "Year", cols[1]: "Chronology"}
-        elif len(cols) >= 13:
-            # Fallback: assume station id first, year second, months third..fourteenth
-            months_short = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-            if len(cols) > 1:
-                prefill[cols[1]] = "Year"
-            for i in range(12):
-                idx = 2 + i
-                if idx < len(cols):
-                    prefill[cols[idx]] = months_short[i]
+        else:
+            detected = _detect_monthly_wide_columns(self._preview_df)
+            if detected is not None:
+                prefill[str(detected["year_col"])] = "Year"
+                for src, dst in zip(detected["month_cols"], MONTH_NAMES):
+                    prefill[str(src)] = dst
+            elif len(cols) >= 13:
+                # Fallback: assume station metadata first, then Year, then 12 months.
+                months_short = MONTH_NAMES[:]
+                if len(cols) > 1:
+                    prefill[cols[1]] = "Year"
+                for i in range(12):
+                    idx = 2 + i
+                    if idx < len(cols):
+                        prefill[cols[idx]] = months_short[i]
 
         dlg = ColumnEditDialog(cols, prefill_rename=prefill, parent=self)
 
@@ -4078,26 +5643,53 @@ class FileImportDialog(QDialog):
         def looks_like_month_headers(names: list[str]) -> bool:
             """
             Return True if the provided column names resemble 12 month columns.
-            Accepts common cases: jan..dec (any case) and numeric 1..12 / 01..12.
+            Accepts common cases: Jan..Dec, Russian short names, Roman numerals,
+            and numeric 1..12 / 01..12.
             """
             if len(names) != 12:
                 return False
-            month_set = {"jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"}
-            hits = 0
+            hits: set[int] = set()
             for n in names:
-                s = str(n).strip().lower()
-                if s in month_set:
-                    hits += 1
+                canonical = _normalize_month_header_token(n)
+                if canonical is not None:
+                    hits.add(MONTH_NAMES.index(canonical))
                     continue
+                s = str(n).strip()
                 if s.isdigit():
                     try:
                         v = int(s)
                     except Exception:
                         v = -1
                     if 1 <= v <= 12:
-                        hits += 1
-                        continue
-            return hits >= 10
+                        hits.add(v - 1)
+            return len(hits) == 12
+
+        # 0) Explicit wide monthly table with year column not necessarily first
+        explicit_wide = _detect_monthly_wide_columns(df)
+        if explicit_wide is not None:
+            self.radio_wide.setChecked(True)
+            self.combo_year.setCurrentText(str(explicit_wide["year_col"]))
+            selected_months = {str(c) for c in explicit_wide["month_cols"]}
+            for i in range(self.list_months.count()):
+                item = self.list_months.item(i)
+                item.setSelected(item.text() in selected_months)
+            if show_message:
+                station_meta = explicit_wide.get("station_meta", {}) or {}
+                if station_meta.get("name") or station_meta.get("code_wmo"):
+                    QMessageBox.information(
+                        self,
+                        "Auto-detect",
+                        "Detected combined station monthly layout with station metadata, "
+                        "a Year column, and 12 month columns. Controls were prefilled.",
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Auto-detect",
+                        "Detected wide Year + 12 month columns layout. Controls were prefilled.",
+                    )
+            self._auto_detect_ok = True
+            return
 
         def looks_like_numeric_month_block(frame: pd.DataFrame, names: list[str]) -> bool:
             """
@@ -4385,8 +5977,8 @@ class FileImportDialog(QDialog):
                 month_items = [item.text() for item in self.list_months.selectedItems()]
                 keep = []
 
+                keep = cols[:]
                 if year_col:
-                    keep.append(year_col)
                     rename[year_col] = "Year"
 
                 if len(month_items) == 12:
@@ -4405,11 +5997,9 @@ class FileImportDialog(QDialog):
                         "Dec",
                     ]
                     for col_name, month_name in zip(month_items, month_labels):
-                        keep.append(col_name)
                         rename[col_name] = month_name
                 else:
                     # If months are not clearly selected, fall back to generic suggestions
-                    keep = cols
                     rename = {}
 
             # ---- Fallback: use the same heuristics as ColumnEditDialog ----
@@ -4476,39 +6066,7 @@ class FileImportDialog(QDialog):
             )
 
     def show_help(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Help - Import")
-        dlg.resize(700, 480)
-        lay = QVBoxLayout()
-        text = QTextEdit()
-        text.setReadOnly(True)
-        text.setHtml(
-            "<h3>Import help</h3>"
-            "<p>This dialog controls how a file is read into a dataset.</p>"
-            "<h4>Steps</h4>"
-            "<ol>"
-            "<li>Set <b>Skip top rows</b> if the file contains metadata above the table.</li>"
-            "<li>If the file has comment lines starting with <code>#</code>, enable the comment option to ignore them.</li>"
-            "<li>Choose whether the file has a header row. If not, temporary names are created and you can rename them.</li>"
-            "<li>Use <b>Edit / Filter Columns</b> to keep, rename, and reorder columns.</li>"
-            "<li>Use <b>Auto-detect layout</b> to propose settings for common layouts (Year+Value, Year+12 months, stacked monthly, etc.).</li>"
-            "</ol>"
-            "<h4>Common formats</h4>"
-            "<ul>"
-            "<li><b>Chronology</b>: Year + one or more series columns.</li>"
-            "<li><b>Monthly climate</b>: Year + 12 month columns (Jan..Dec). Sentinel values like -999 are treated as missing during analysis.</li>"
-            "<li><b>GRDC discharge</b>: GRDC monthly discharge is detected and imported automatically. Empty GRDC files are skipped.</li>"
-            "<li><b>Combined station CSV</b>: A file with many stations stacked by rows (e.g., Country/Code/Name/year/jan..dec) can be split into one dataset per station automatically.</li>"
-            "</ul>"
-            "<p><b>Tip:</b> If Auto-detect looks correct, you can press OK without opening a manual preview.</p>"
-
-        )
-        lay.addWidget(text)
-        ok = QPushButton("Close")
-        ok.clicked.connect(dlg.accept)
-        lay.addWidget(ok)
-        dlg.setLayout(lay)
-        dlg.exec()
+        _show_html_help_dialog(self, "Help - Import", IMPORT_HELP_HTML, width=760, height=600)
 
     def show_help_about(self) -> None:
         """Compatibility wrapper for older Help/About actions."""
@@ -4836,7 +6394,7 @@ class LargeGridImportDialog(QDialog):
         )
         self.btn_preview.clicked.connect(self.on_preview)
 
-        self.btn_run = QPushButton("Run extraction")
+        self.btn_run = PrimaryButton("Run extraction")
         self.btn_run.clicked.connect(self.on_run)
 
         self.btn_export = QPushButton("Export...")
@@ -5764,16 +7322,29 @@ class MainWindow(QMainWindow):
         self.last_dir_open: str = os.path.expanduser("~")
         self.last_dir_project: str = os.path.expanduser("~")
         self.last_dir_export: str = os.path.expanduser("~")
+        # Online data dialog (ITRDB / CRU TS)
+        self.online_settings: Dict[str, Any] = {}
+        self._online_dialog = None
         # allow small laptops
         self.setMinimumSize(720, 480)
         self._init_ui()
         self.load_settings()
+        self._help_shortcut = QShortcut(QKeySequence("F1"), self)
+        self._help_shortcut.setContext(Qt.ApplicationShortcut)
+        self._help_shortcut.activated.connect(self.show_help)
 
         if self._prefill_manifest:
             QTimer.singleShot(
                 0,
                 lambda p=self._prefill_manifest: self._handle_prefill_manifest(p),
             )
+        # session recovery: autosave every 2 minutes (and after analyses / data changes)
+        self._results_unsaved = False
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setInterval(120000)
+        self._recovery_timer.timeout.connect(lambda: self._autosave_session(now=True))
+        self._recovery_timer.start()
+        QTimer.singleShot(1500, self._check_recovery)
 
     def _request_user_attention(self) -> None:
         """Bring the main window to the front and request taskbar attention."""
@@ -5893,6 +7464,12 @@ class MainWindow(QMainWindow):
 
                 df = pd.read_csv(path)
                 ds = DataSet(name=name, path=path, df=df, kind=kind)
+                loc = e.get("location") or {}
+                if loc.get("lat") is not None and loc.get("lon") is not None:
+                    setattr(ds, "meta", {"source": "Detrend Advisor", "lat": float(loc["lat"]),
+                                         "lon": float(loc["lon"]), "site_code": loc.get("site_code", ""),
+                                         "site_name": loc.get("site_name", ""), "species": loc.get("species", ""),
+                                         "elevation_m": loc.get("elevation_m")})
 
                 # Ensure Year is preferred when present.
                 if "Year" in df.columns:
@@ -5912,6 +7489,18 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 label = str(e.get("name", e.get("path", "(unknown)")))
                 errors.append(f"{label}: {exc}")
+        # show the new chronologies in the Analysis lists (they were only in the Data tab before)
+        try:
+            self.refresh_analysis_lists()
+            self._refresh_loaded_dataset_list_labels()
+        except Exception:
+            pass
+        if added:
+            self.statusBar().showMessage(f"Detrend Advisor: {added} dataset(s) added", 8000)
+        if errors:
+            QMessageBox.warning(self, "Prefill import",
+                                f"{len(errors)} dataset(s) could not be imported:\n\n" + "\n".join(errors[:15]))
+
     def _get_dataset_year_range_safe(self, ds: "DataSet") -> tuple[int, int] | None:
         """
         Return (min_year, max_year) for a dataset using its configured year column.
@@ -6238,6 +7827,25 @@ class MainWindow(QMainWindow):
         self.spin_ui_scale.valueChanged.connect(self._apply_ui_scale)
         tools_row.addWidget(self.spin_ui_scale)
 
+        if _uihelp is not None and hasattr(_uihelp, "qt_saved_link_label"):
+            self.lbl_open_export = _uihelp.qt_saved_link_label(self)
+            self.lbl_open_export.setToolTip("Open the folder of the last exported file")
+            tools_row.addWidget(self.lbl_open_export)
+
+        self.btn_updates = QPushButton("Updates")
+        self.btn_updates.setToolTip("Check for updates, download the latest version and the user guides, "
+                                    "contact the developer")
+        tools_row.addWidget(self.btn_updates)
+        self.updater = None
+        if _appupd_qt is not None:
+            try:
+                self.updater = _appupd_qt.QtUpdater(self, button=self.btn_updates)
+            except Exception as exc:  # pragma: no cover
+                print("Updater not available:", exc)
+                self.btn_updates.setEnabled(False)
+        else:
+            self.btn_updates.setEnabled(False)
+
         self.btn_cite = QPushButton("Cite")
         self.btn_cite.setToolTip("Open citation dialog")
         self.btn_cite.clicked.connect(self.show_cite)
@@ -6301,68 +7909,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def show_help(self) -> None:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Help")
-        dlg.resize(820, 620)
-        lay = QVBoxLayout()
-        text = QTextEdit()
-        text.setReadOnly(True)
-        text.setHtml(
-            "<h2>RingClim</h2>"
-            "<p><b>Purpose:</b> correlate tree-ring chronologies with climate datasets, daily/hourly series, "
-            "or other chronologies; preview transformed data tables; and export results, plots, windows, merged data, "
-            "and reports.</p>"
-            "<h3>General</h3>"
-            "<ul>"
-            "<li><b>UI scale</b> is in the bottom status bar and is saved between sessions.</li>"
-            "<li><b>Help / About / Cite</b> are available in the bottom status bar.</li>"
-            "<li>Double-click a dataset in <b>Data</b> to preview it.</li>"
-            "<li>Project save/load stores imported datasets and metadata for later reuse.</li>"
-            "</ul>"
-            "<h3>Data tab</h3>"
-            "<ul>"
-            "<li><b>Add / Import File</b>: import chronology, monthly climate, or time-series data from text, CSV, PRN, and Excel files.</li>"
-            "<li><b>Add multiple files</b>: batch-import many files. If formats are identical, the first manual mapping can be reused.</li>"
-            "<li><b>Large gridded data</b>: extract a time series from gridded NetCDF data using coordinates and a bounding box.</li>"
-            "<li>Specialized automatic import is available for supported formats such as GRDC monthly runoff and GRDC daily/hourly discharge.</li>"
-            "<li><b>Edit Selected</b>: rename columns, drop columns, or adjust imported dataset structure after import.</li>"
-            "<li>The preview can show transformed monthly or daily wide tables, not only raw two-column input.</li>"
-            "</ul>"
-            "<h3>Analysis tab</h3>"
-            "<ul>"
-            "<li><b>Correlation target</b>: choose chronology × climate or chronology × chronology.</li>"
-            "<li><b>Resolution</b>: use <b>Monthly</b> for monthly windows or <b>Daily</b> for same-year daily windows built from daily/hourly series.</li>"
-            "<li>In Monthly mode, daily/hourly series can be aggregated to monthly values using <b>Auto</b>, <b>sum</b>, or <b>mean</b>.</li>"
-            "<li>In Daily mode, hourly values are first aggregated to daily values, then correlations are computed for rolling day windows.</li>"
-            "<li><b>Preview selected daily table</b> lets you inspect the actual Year × Jan01..Dec31 table used by the analysis.</li>"
-            "<li><b>Use common period</b> restricts analysis to overlapping years across selected datasets.</li>"
-            "<li>Missing-value controls support ignoring missing values, strict complete-window logic, local-window fill, limited interpolation, and monthly-mean filling where available.</li>"
-            "<li><b>Run analysis</b> computes correlations and sends the outputs to the Results and Report tabs.</li>"
-            "</ul>"
-            "<h3>Results tab</h3>"
-            "<ul>"
-            "<li>Use <b>Show</b> to switch between main correlations and period correlations.</li>"
-            "<li>Select rows to update the plot for the chosen pair/window.</li>"
-            "<li><b>Export</b> can save all results, climate windows, merged data for the selected result, or the current plot as PNG.</li>"
-            "</ul>"
-            "<h3>Report tab</h3>"
-            "<ul>"
-            "<li>The report tab summarizes top relationships from the current results table.</li>"
-            "<li><b>Export report</b> saves the report table for later use in writing or review.</li>"
-            "</ul>"
-            "<h3>Notes</h3>"
-            "<ul>"
-            "<li>Climate variable type is guessed automatically from headers, metadata comments, GRDC content, or file names, but can always be corrected manually.</li>"
-            "<li>Daily mode currently uses same-year daily windows; monthly mode remains the main full-featured window engine.</li>"
-            "</ul>"
+    def show_help(self, anchor: str = "") -> None:
+        """Open the full, searchable Help dialog (F1)."""
+        _show_html_help_dialog(
+            self,
+            "Help - Ring-Climate Analyzer",
+            RINGCLIM_HELP_HTML,
+            anchor=str(anchor or ""),
         )
-        lay.addWidget(text)
-        ok = QPushButton("Close")
-        ok.clicked.connect(dlg.accept)
-        lay.addWidget(ok)
-        dlg.setLayout(lay)
-        dlg.exec()
 
     def show_help_about(self) -> None:
         """Compatibility wrapper for older Help/About actions."""
@@ -6377,7 +7931,9 @@ class MainWindow(QMainWindow):
         text.setReadOnly(True)
         text.setHtml(
             "<h2>Ring-Climate Analyzer</h2>"
-            "<p><b>Author:</b> Dr. Zulfiyor Bakhtiyorov</p>"
+            + (f"<p><b>Version:</b> {_appupd.version_text()} - part of {_appupd.display_name()}</p>"
+               if _appupd is not None else "")
+            + "<p><b>Author:</b> Dr. Zulfiyor Bakhtiyorov</p>"
             "<p><b>Institution:</b> University of Cambridge, Xinjiang Institute of Ecology and Geography CAS, "
             "Khujand Science Center NAST</p>"
             "<p><b>Year:</b> 2026</p>"
@@ -6408,67 +7964,6 @@ class MainWindow(QMainWindow):
         dlg.setLayout(lay)
         dlg.exec()
 
-    def show_help(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Help - Import")
-        dlg.resize(700, 480)
-        lay = QVBoxLayout()
-        text = QTextEdit()
-        text.setReadOnly(True)
-        text.setHtml(
-            "<h2>Ring-Climate Analyzer</h2>"
-            "<p><b>Purpose:</b> correlate tree-ring chronologies with climate variables using monthly windows "
-            "(including previous-year months), visualize results, and export tables/reports.</p>"
-            "<h3>Interface scaling</h3>"
-            "<ul>"
-            "<li>Use <b>UI scale</b> in the bottom status bar to shrink/enlarge the interface.</li>"
-            "<li>The value is saved in <code>~/.ringclim_settings.json</code> and restored on startup.</li>"
-            "</ul>"
-            "<h3>Data tab</h3>"
-            "<ul>"
-            "<li><b>Add / Import File</b>: import chronology or climate data from text/CSV/Excel.</li>"
-            "<li><b>Add multiple files</b>: batch import several files in sequence.</li>"
-            "<li><b>Large gridded data.</b>: import/extract from gridded NetCDF (requires <code>xarray</code>).</li>"
-            "<li><b>Edit Selected</b>: rename/drop columns after import.</li>"
-            "<li><b>Save project / Load project</b>: store datasets to a JSON project file and reopen later.</li>"
-            "</ul>"
-            "<h3>Import dialog (File Import - Column mapping)</h3>"
-            "<ul>"
-            "<li>Supports files <b>with or without headers</b>. If no header: uncheck the header option and rename columns.</li>"
-            "<li><b>Skip top rows</b> removes metadata blocks at the top of the file.</li>"
-            "<li>Optionally ignore comment lines starting with <code>#</code>.</li>"
-            "<li><b>Auto-detect layout</b> proposes common formats (Year+12 months, stacked Month/Value, two-column series, etc.).</li>"
-            "</ul>"
-            "<h3>Analysis tab</h3>"
-            "<ul>"
-            "<li>Select one or more <b>Chronologies</b> and <b>Climate datasets</b> for analysis.</li>"
-            "<li><b>Years</b>: set analysis start/end years.</li>"
-            "<li><b>Window lengths</b>: min/max number of months in climate windows (1..24).</li>"
-            "<li><b>Correlation</b>: Pearson or Spearman (p-values require <code>scipy</code>).</li>"
-            "<li><b>Aggregation</b>: sum/mean or Auto-by-variable (e.g., precipitation → sum, temperature → mean).</li>"
-            "<li><b>Season filter</b>: restrict windows to a season (Apr–Sep / Oct–Mar / Custom).</li>"
-            "<li><b>Periods</b>: optional period analysis modes (grid/sliding/anchored) if enabled.</li>"
-            "</ul>"
-            "<h3>Results tab</h3>"
-            "<ul>"
-            "<li>Shows correlation results and plots (heatmaps/figures) for selected series/windows.</li>"
-            "<li>Export tables/plots via the provided export actions (CSV/Excel/PNG where available).</li>"
-            "</ul>"
-            "<h3>Report tab</h3>"
-            "<ul>"
-            "<li>Builds a compact report of top correlations and significance flags (when p-values are available).</li>"
-            "<li>Export report to Excel/CSV.</li>"
-            "</ul>"
-            "<hr>"
-            "<p><b>Author signature:</b> Developed by   Dr. Zulfiyor Bakhtiyorov</p>"
-        )
-        lay.addWidget(text)
-        ok = QPushButton("Close")
-        ok.clicked.connect(dlg.accept)
-        lay.addWidget(ok)
-        dlg.setLayout(lay)
-        dlg.exec()
-
     def _init_status_bar(self) -> None:
         """
         Create a bottom status bar with a left signature and a right Help/About link.
@@ -6487,73 +7982,8 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._status_right)
 
     def show_about_dialog(self) -> None:
-        """Show a detailed Help / About dialog."""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Help / About")
-        dlg.resize(820, 640)
-
-        lay = QVBoxLayout()
-        text = QTextEdit()
-        text.setReadOnly(True)
-        text.setHtml(
-            "<h2>Ring-Climate Analyzer</h2>"
-            "<p>This application imports dendrochronology series and climate data, builds climate windows, "
-            "and computes correlations between chronologies and climate windows.</p>"
-
-            "<h3>Workflow</h3>"
-            "<ol>"
-            "<li><b>Data tab</b>: import chronologies and climate datasets (single file or multi-file).</li>"
-            "<li><b>Analysis tab</b>: choose a chronology, one or more climate datasets, and configure window settings.</li>"
-            "<li><b>Run</b>: calculate correlations and review the ranked results table.</li>"
-            "<li><b>Export</b>: save results to CSV and/or export plots.</li>"
-            "</ol>"
-
-            "<h3>Import</h3>"
-            "<ul>"
-            "<li>Use <b>Add / Import File</b> to import one file, or multi-import to add many files at once.</li>"
-            "<li>The import dialog supports header/no-header files, metadata lines, and comment lines starting with <code>#</code>.</li>"
-            "<li><b>Auto-detect</b> proposes settings for typical formats (Year+Value, Year+12 months, stacked monthly, etc.).</li>"
-            "<li><b>Combined station CSV</b>: files with columns like Country/Code_WMO/Name/year/jan..dec are split into one dataset per station. "
-            "Dataset names are created as <code>Name (Code_WMO_Country)</code>.</li>"
-            "<li><b>GRDC discharge</b>: GRDC monthly discharge is auto-detected. Empty GRDC files are skipped and reported after batch import.</li>"
-            "</ul>"
-
-            "<h3>Missing values in climate data</h3>"
-            "<p>Sentinels like <code>-999</code> are treated as missing. Years where all 12 monthly values are missing are removed automatically.</p>"
-            "<ul>"
-            "<li><b>Ignore missing</b>: window sums/means use available months (NaN-aware). This preserves more years, but windows may be based on fewer months.</li>"
-            "<li><b>Strict</b>: if any month inside a window is missing, the window value is set to NaN for that year (the year is excluded from correlation for that window).</li>"
-            "<li><b>Fill with monthly mean</b>: replaces missing values with the long-term mean of that month (per dataset/station).</li>"
-            "<li><b>Fill with local window mean (K)</b>: for each missing value, collects up to K valid values before and K after (same month across years, skipping missing values). "
-            "A value is filled only if at least K valid values are available in total.</li>"
-            "<li><b>Linear interpolation (N)</b>: fills only interior gaps by linear interpolation if the gap has at most N consecutive missing points (per month). "
-            "Leading/trailing missing values remain missing.</li>"
-            "</ul>"
-
-            "<h3>Analysis settings</h3>"
-            "<ul>"
-            "<li><b>Window length</b>: choose minimum and maximum window length in months (e.g., 1..24). Windows include previous-year months (pJan..pDec).</li>"
-            "<li><b>Aggregation</b>: sum or mean for each climate window (depends on climate parameter).</li>"
-            "<li><b>Season filter</b>: optionally restrict results to windows overlapping a selected season range.</li>"
-            "<li><b>Correlation method</b>: Pearson or Spearman (p-values require SciPy).</li>"
-            "</ul>"
-
-            "<h3>Tips</h3>"
-            "<ul>"
-            "<li>If your climate data has many gaps, start with <b>Strict</b> to avoid partial windows, then try local mean fill if you need longer overlap.</li>"
-            "<li>Use consistent year ranges across datasets when comparing stations.</li>"
-            "</ul>"
-
-            "<p style='color:#666;'>© Dr. Z. Bakhtiyorov</p>"
-        )
-
-        lay.addWidget(text)
-        btn = QPushButton("Close")
-        btn.clicked.connect(dlg.accept)
-        lay.addWidget(btn)
-
-        dlg.setLayout(lay)
-        dlg.exec()
+        """Compatibility wrapper: open the full Help dialog."""
+        self.show_help()
 
     def apply_ui_scale(self, scale: float) -> None:
         """
@@ -6572,17 +8002,28 @@ class MainWindow(QMainWindow):
 
     def _init_tab_data(self):
         layout = QVBoxLayout()
-        btn_layout = QHBoxLayout()
+        btn_layout = FlowLayout(spacing=6)  # wraps on narrow screens instead of cutting the buttons
         btn_add = QPushButton("Add / Import File")
         btn_add_multi = QPushButton("Add multiple files")
         btn_large = QPushButton("Large gridded data...")
+        btn_online = QPushButton("Online data...")
+        btn_online.setToolTip("Download chronologies from ITRDB and climate data (CRU TS, CHELSA, TerraClimate, GPCC, "
+                              "SPEI, CHIRPS, GHCN stations, ERA5 ...) with a location map; export locations to GIS")
+        btn_online.clicked.connect(self.open_online_data_dialog)
         btn_remove = QPushButton("Remove Selected")
         btn_edit = QPushButton("Edit Selected")
-        btn_edit.setToolTip("Edit / rename / drop columns of the selected dataset")
+        btn_edit.setToolTip("Reopen the import dialog for the selected dataset (layout, columns, names, climate type)")
         btn_edit.clicked.connect(self.edit_selected_dataset)
         btn_save_project = QPushButton("Save project")
         btn_load_project = QPushButton("Load project")
         btn_add_project = QPushButton("Add project")
+        btn_add.setToolTip("Import one file (CSV, TXT, PRN, XLS, XLSX); GRDC and station tables are detected automatically")
+        btn_add_multi.setToolTip("Import many files; identical layouts can be imported automatically")
+        btn_large.setToolTip("Extract a point or area time series from a NetCDF grid (CRU TS etc.)")
+        btn_remove.setToolTip("Remove the selected datasets from the project")
+        btn_save_project.setToolTip("Save all datasets to a JSON project file")
+        btn_load_project.setToolTip("Open a project (replace the session or merge into it)")
+        btn_add_project.setToolTip("Merge another project into the current session")
         btn_save_project.clicked.connect(self.save_project_as)
         btn_load_project.clicked.connect(self.load_project)
         btn_add_project.clicked.connect(self.add_project)
@@ -6593,16 +8034,45 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(btn_add)
         btn_layout.addWidget(btn_add_multi)
         btn_layout.addWidget(btn_large)
-        btn_layout.addWidget(btn_remove)
+        btn_layout.addWidget(btn_online)
+        btn_batch_folder = QPushButton("Import batch folder...")
+        btn_batch_folder.setToolTip("Add all datasets of a folder written by 'Download everything for the area' "
+                                    "(e.g. by another RingClim window), with their metadata")
+        btn_batch_folder.clicked.connect(self.import_batch_folder)
+        btn_layout.addWidget(btn_batch_folder)
+        btn_redetect = QPushButton("Detect climate types")
+        btn_redetect.setToolTip("Set the climate variable type of every climate dataset again from the batch "
+                                "manifest (datasets.json / summary.csv), the file header and the file name")
+        btn_redetect.clicked.connect(self.redetect_climate_types)
+        btn_layout.addWidget(btn_redetect)
+        btn_spatial = QPushButton("Spatial correlation...")
+        btn_spatial.setToolTip("Correlation maps of a chronology with gridded climate (like the KNMI Climate Explorer), "
+                               "with a summary of the correlation results and suggested maps")
+        btn_spatial.clicked.connect(self.open_field_panel)
+        btn_layout.addWidget(btn_spatial)
+        btn_moving = QPushButton("Moving correlation...")
+        btn_moving.setToolTip("Running (moving-window) correlations: is the climate signal stable over time? "
+                              "With stability statistics and a test of change")
+        btn_moving.clicked.connect(self.open_moving_panel)
+        btn_layout.addWidget(btn_moving)
         btn_layout.addWidget(btn_edit)
+        btn_layout.addWidget(btn_remove)
+        btn_remove.setText("Remove selected (Del)")
         btn_layout.addWidget(btn_save_project)
         btn_layout.addWidget(btn_load_project)
         btn_layout.addWidget(btn_add_project)
-        btn_layout.addStretch(1)
-        layout.addLayout(btn_layout)
+        layout.addWidget(FlowBar(btn_layout))
 
         self.list_datasets = QListWidget()
         self.list_datasets.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_datasets.setToolTip("Double-click a dataset to preview it. Ctrl+C copies the selected names. "
+                                      "Delete removes the selected datasets.")
+        _del = QShortcut(QKeySequence(Qt.Key_Delete), self.list_datasets)
+        _del.setContext(Qt.WidgetWithChildrenShortcut)
+        _del.activated.connect(self._remove_by_key)
+        _bs = QShortcut(QKeySequence(Qt.Key_Backspace), self.list_datasets)  # Mac keyboards
+        _bs.setContext(Qt.WidgetWithChildrenShortcut)
+        _bs.activated.connect(self._remove_by_key)
         layout.addWidget(QLabel("Loaded datasets:"))
         layout.addWidget(self.list_datasets)
         # Double-click any dataset to preview how it was imported.
@@ -6806,11 +8276,686 @@ class MainWindow(QMainWindow):
             f"Dataset '{ds.name}' added to the project.",
         )
 
+    # ---- Online data (ITRDB / CRU TS) ----
+    def open_online_data_dialog(self) -> None:
+        """Open (or raise) the non-modal online data dialog."""
+        if _online_qt is None:
+            QMessageBox.warning(
+                self,
+                "Online data",
+                "Online data module is not available.\n\n"
+                "Put dendro_online.py, dendro_online_qt.py, dendro_sources.py, dendro_sources_qt.py, dendro_copernicus.py, "
+                "dendro_geoexport.py and dendro_online_countries.geojson into the dendro_modules folder next to ringclim.py.\n\n"
+                + _ONLINE_IMPORT_ERROR,
+            )
+            return
+        if self._online_dialog is not None:
+            dock = getattr(self, "_online_dock", None)
+            if dock is not None:
+                dock.show()
+            else:
+                self._online_dialog.show()
+                self._online_dialog.raise_()
+                self._online_dialog.activateWindow()
+            return
+        dlg = _online_qt.OnlineDataDialog(self, settings=self.online_settings, month_names=MONTH_NAMES)
+        dlg.datasets_ready.connect(self._add_online_datasets)
+        dlg.settings_changed.connect(self._on_online_settings_changed)
+        dlg.finished.connect(self._on_online_dialog_closed)
+        self._online_dialog = dlg
+        self._push_chronology_locations()
+        self._online_dock = None
+        if _uihelp is not None and hasattr(_uihelp, "QtTabDock") and hasattr(dlg, "set_dock"):
+            # default: a tab of the main window; "Detach to window" makes it a separate window
+            self._online_dock = _uihelp.QtTabDock(self.tabs, dlg, "Online data")
+            dlg.set_dock(self._online_dock)
+            self._online_dock.attach()
+        else:
+            dlg.show()
+
+    # -----------------------
+    # Session recovery (autosave after analyses and data changes; offered again after a crash)
+    # -----------------------
+    def _recovery_dir(self) -> str:
+        d = os.path.join(os.path.expanduser("~"), ".ringclim_recovery")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _recovery_path(self) -> str:
+        return os.path.join(self._recovery_dir(), f"session-{os.getpid()}.pkl")
+
+    @staticmethod
+    def _dataset_record(ds: "DataSet") -> Dict[str, Any]:
+        return {"name": ds.name, "path": getattr(ds, "path", ""), "kind": ds.kind,
+                "climate_param": getattr(ds, "climate_param", "Other"), "year_col": ds.year_col,
+                "value_columns": list(ds.value_columns or []), "month_columns": list(ds.month_columns or []),
+                "source_freq": getattr(ds, "source_freq", ""), "meta": getattr(ds, "meta", None),
+                "monthly_agg": getattr(ds, "monthly_agg", None),
+                "derived_from_kind": getattr(ds, "derived_from_kind", None),
+                "columns_config": getattr(ds, "columns_config", None), "df": ds.df}
+
+    def _dataset_from_record(self, d: Dict[str, Any]) -> "DataSet":
+        ds = DataSet(name=d.get("name", "dataset"), path=d.get("path", ""), df=d["df"], kind=d.get("kind", "chronology"))
+        ds.year_col = d.get("year_col", ds.year_col)
+        ds.value_columns = d.get("value_columns", ds.value_columns)
+        ds.month_columns = d.get("month_columns", ds.month_columns)
+        ds.climate_param = d.get("climate_param", "Other")
+        for attr in ("source_freq", "meta", "monthly_agg", "derived_from_kind", "columns_config"):
+            if d.get(attr) is not None:
+                setattr(ds, attr, d.get(attr))
+        return ds
+
+    def _schedule_autosave(self) -> None:
+        t = getattr(self, "_autosave_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(5000)
+            t.timeout.connect(lambda: self._autosave_session(now=True))
+            self._autosave_timer = t
+        t.start()
+
+    def _autosave_session(self, now: bool = False) -> None:
+        """Write the datasets and results to the recovery file (in the background)."""
+        if not now:
+            self._schedule_autosave()
+            return
+        if getattr(self, "_restoring", False):
+            return
+        has_res = self.result_df is not None and not self.result_df.empty
+        if not self.datasets and not has_res:
+            return
+        import pickle
+        import threading
+        import time as _time
+
+        payload = {
+            "version": 1, "time": _time.time(), "pid": os.getpid(),
+            "project_path": getattr(self, "current_project_path", None),
+            "datasets": [self._dataset_record(ds) for ds in self.datasets],
+            "result_df": self.result_df, "period_result_df": self.period_result_df,
+            "results_unsaved": bool(getattr(self, "_results_unsaved", False)),
+            "pair_cache": dict(getattr(self, "_pair_cache", None) or {}),
+            "moving_screen_df": getattr(self, "moving_screen_df", None),
+            "field_screen_df": getattr(self, "field_screen_df", None),
+        }
+        path = self._recovery_path()
+
+        def write() -> None:
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as fh:
+                    pickle.dump(payload, fh, protocol=4)
+                os.replace(tmp, path)
+            except Exception as exc:  # pragma: no cover
+                print("Session autosave failed:", exc)
+
+        threading.Thread(target=write, daemon=True).start()
+
+    def _discard_recovery(self) -> None:
+        try:
+            os.remove(self._recovery_path())
+        except OSError:
+            pass
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        if pid <= 0 or pid == os.getpid():
+            return pid == os.getpid()
+        if sys.platform == "win32":
+            import ctypes
+
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, pid)
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            k.CloseHandle(h)
+            return bool(ok) and code.value == 259
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _check_recovery(self) -> None:
+        """Offer sessions of RingClim windows that ended without closing properly."""
+        import pickle
+        import time as _time
+
+        try:
+            files = [os.path.join(self._recovery_dir(), f) for f in os.listdir(self._recovery_dir())
+                     if f.startswith("session-") and f.endswith(".pkl")]
+        except OSError:
+            return
+        for path in sorted(files, key=os.path.getmtime, reverse=True):
+            try:
+                pid = int(os.path.basename(path)[8:-4])
+            except ValueError:
+                continue
+            if self._pid_alive(pid):
+                continue  # another RingClim window is still open
+            try:
+                with open(path, "rb") as fh:
+                    data = pickle.load(fh)
+            except Exception:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            n_ds = len(data.get("datasets") or [])
+            res = data.get("result_df")
+            n_res = 0 if res is None else len(res)
+            when = _time.strftime("%d.%m.%Y %H:%M", _time.localtime(data.get("time", os.path.getmtime(path))))
+            box = QMessageBox(self)
+            box.setWindowTitle("Restore session")
+            box.setIcon(QMessageBox.Question)
+            box.setText(f"RingClim was closed unexpectedly on {when}.\n\nThe last session can be restored: "
+                        f"{n_ds} dataset(s)" + (f" and {n_res:,} correlation result rows" if n_res else "") + ".")
+            box.setInformativeText("Restore it now?")
+            b_restore = box.addButton("Restore", QMessageBox.AcceptRole)
+            b_discard = box.addButton("Discard", QMessageBox.DestructiveRole)
+            box.addButton("Later", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() == b_restore:
+                self._restore_session(data)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                self._autosave_session(now=True)
+                return
+            if box.clickedButton() == b_discard:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return
+
+    def _restore_session(self, data: Dict[str, Any]) -> None:
+        self._restoring = True
+        try:
+            names = {ds.name for ds in self.datasets}
+            for d in data.get("datasets") or []:
+                if d.get("name") in names:
+                    continue
+                ds = self._dataset_from_record(d)
+                self.datasets.append(ds)
+                try:
+                    label = self._format_dataset_label(ds, include_kind=True)
+                except Exception:
+                    label = f"{ds.name} ({ds.kind})"
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, ds)
+                self.list_datasets.addItem(item)
+            if data.get("project_path") and not getattr(self, "current_project_path", None):
+                self.current_project_path = data.get("project_path")
+            self.refresh_analysis_lists()
+            res = data.get("result_df")
+            if res is not None and not res.empty:
+                self._set_results(res, data.get("period_result_df"))
+                self._results_unsaved = bool(data.get("results_unsaved", True))
+            if isinstance(data.get("pair_cache"), dict):
+                self._pair_cache = dict(data["pair_cache"])
+            for attr in ("moving_screen_df", "field_screen_df"):
+                if isinstance(data.get(attr), pd.DataFrame):
+                    setattr(self, attr, data[attr])
+                self.tabs.setCurrentWidget(self.tab_results)
+        finally:
+            self._restoring = False
+        self.statusBar().showMessage("Session restored.", 15000)
+
+    def _set_results(self, df: pd.DataFrame, periods: Optional[pd.DataFrame] = None) -> None:
+        """Show a results table (restored session or project) like after an analysis."""
+        self.result_df = df
+        self.period_result_df = periods if periods is not None else pd.DataFrame()
+        self._refresh_result_type_list()
+        self.filtered_result_df = self._filter_results(self.result_df)
+        self.filtered_period_df = self._filter_results(self.period_result_df)
+        try:
+            self._create_report_from_results()
+        except Exception as exc:
+            print("Report could not be rebuilt:", exc)
+        self.update_results_table()
+        for attr in ("_field_panel", "_moving_panel"):
+            fp = getattr(self, attr, None)
+            if fp is not None:
+                try:
+                    fp.refresh_from_host()
+                except Exception:
+                    pass
+
+    def notify_saved(self, title: str, text: str, path: str) -> None:
+        """Message with a clickable location; the 'Open export folder' link at the bottom keeps it."""
+        try:  # results exported from the Results / Report tab count as saved
+            if self.tabs.currentWidget() in (getattr(self, "tab_results", None), getattr(self, "tab_report", None)):
+                self._results_unsaved = False
+        except Exception:
+            pass
+        if _uihelp is not None and hasattr(_uihelp, "qt_notify_saved"):
+            _uihelp.qt_notify_saved(self, title, text, path)
+        else:
+            QMessageBox.information(self, title, f"{text}\n\n{path}")
+        try:
+            self.statusBar().showMessage(f"{text} {path}", 15000)
+        except Exception:
+            pass
+
+    def import_batch_folder(self, folder: str = "") -> None:
+        """Add every dataset of a batch folder (datasets.json, or summary.csv + data/*.csv)."""
+        if not folder:
+            start = os.path.join(os.path.expanduser("~"), "DeClim_batch")
+            folder = QFileDialog.getExistingDirectory(self, "Batch folder (batch_...)",
+                                                      start if os.path.isdir(start) else os.path.expanduser("~"))
+        if not folder:
+            return
+        import re as _re
+
+        def safe(name: str) -> str:
+            return (_re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "dataset")[:80]
+
+        entries: List[Dict[str, Any]] = []
+        problems: List[str] = []
+        man = os.path.join(folder, "datasets.json")
+        items: List[Dict[str, Any]] = []
+        if os.path.exists(man):
+            try:
+                with open(man, "r", encoding="utf-8") as fh:
+                    items = list(json.load(fh).get("datasets", []))
+            except Exception as exc:
+                problems.append(f"datasets.json: {exc}")
+        if not items:
+            summ = os.path.join(folder, "summary.csv")
+            if not os.path.exists(summ):
+                QMessageBox.warning(self, "Import batch folder",
+                                    "No datasets.json or summary.csv in this folder. Choose a folder batch_... "
+                                    "written by 'Download everything for the area'.")
+                return
+            sm = pd.read_csv(summ, encoding="utf-8-sig")
+            data_dir = os.path.join(folder, "data")
+            files = {os.path.splitext(f)[0]: f for f in os.listdir(data_dir)} if os.path.isdir(data_dir) else {}
+            for _i, r in sm.iterrows():
+                name = str(r.get("dataset", ""))
+                f = files.get(safe(name)) or next((v for k, v in files.items() if k.startswith(safe(name)[:40])), None)
+                if f is None:
+                    problems.append(f"{name}: file not found")
+                    continue
+                meta = {k: (None if pd.isna(v) else v) for k, v in r.items()
+                        if k in ("source", "variable", "units", "lat", "lon", "method", "citation", "warning")}
+                items.append({"name": name, "kind": str(r.get("kind", "climate")),
+                              "climate_param": str(r.get("climate_type", "Other") or "Other"),
+                              "file": "data/" + f, "meta": meta})
+        for it in items:
+            try:
+                path = os.path.join(folder, str(it.get("file", "")).replace("/", os.sep))
+                df = pd.read_csv(path)
+                kind = str(it.get("kind", "climate"))
+                if kind == "timeseries" and "DateTime" in df.columns:
+                    df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
+                meta = dict(it.get("meta") or {})
+                meta["select_for_analysis"] = True
+                meta.setdefault("imported_from", folder)
+                e = {"kind": kind, "name": it.get("name") or os.path.basename(path), "path": path, "df": df,
+                     "climate_param": it.get("climate_param", "Other"), "meta": meta}
+                for k in ("value_column", "source_freq", "monthly_agg"):
+                    if it.get(k):
+                        e[k] = it[k]
+                entries.append(e)
+            except Exception as exc:
+                problems.append(f"{it.get('name')}: {exc}")
+        have = {ds.name for ds in self.datasets}
+        dup = [e for e in entries if e["name"] in have]
+        if dup and QMessageBox.question(
+                self, "Import batch folder",
+                f"{len(dup)} of {len(entries)} dataset(s) are already loaded (same name). Skip them?") == QMessageBox.Yes:
+            entries = [e for e in entries if e["name"] not in have]
+        if entries:
+            self._add_online_datasets(entries)
+        msg = f"{len(entries)} dataset(s) added from\n{folder}"
+        if problems:
+            msg += "\n\nProblems:\n" + "\n".join(problems[:15])
+        QMessageBox.information(self, "Import batch folder", msg)
+
+    def redetect_climate_types(self) -> None:
+        """Re-detect climate_param of all climate datasets (manifest, header, file name)."""
+        changes = []
+        for ds in self.datasets:
+            if getattr(ds, "kind", "") not in ("climate", "timeseries"):
+                continue
+            path = getattr(ds, "path", "") or ""
+            bm = batch_metadata_for_file(path) if path else None
+            guess = ((bm or {}).get("climate_param") or (guess_climate_param_from_metadata(path) if path else None)
+                     or guess_climate_param_from_name(path or ds.name, "")
+                     or guess_climate_param_from_name(ds.name + ".csv", ""))
+            if guess and guess != getattr(ds, "climate_param", "Other"):
+                changes.append((ds, getattr(ds, "climate_param", "Other"), guess))
+        if not changes:
+            QMessageBox.information(self, "Detect climate types", "All climate types already match.")
+            return
+        text = "\n".join(f"{ds.name}: {old} -> {new}" for ds, old, new in changes[:40])
+        if len(changes) > 40:
+            text += f"\n... and {len(changes) - 40} more"
+        if QMessageBox.question(self, "Detect climate types",
+                                f"{len(changes)} dataset(s) get another type:\n\n{text}\n\nApply?") != QMessageBox.Yes:
+            return
+        for ds, _old, new in changes:
+            ds.climate_param = new
+        for i in range(self.list_datasets.count()):
+            it = self.list_datasets.item(i)
+            ds = it.data(Qt.UserRole)
+            if any(ds is c[0] for c in changes):
+                try:
+                    it.setText(self._format_dataset_label(ds, include_kind=True))
+                except Exception:
+                    pass
+        self.refresh_analysis_lists()
+        self.statusBar().showMessage(f"Climate type changed for {len(changes)} dataset(s).", 10000)
+
+    # ---- Spatial correlation page ----
+    def open_field_panel(self) -> None:
+        """Open (or show) the spatial correlation page; by default it is a tab of the main window."""
+        if _field_qt is None:
+            QMessageBox.warning(self, "Spatial correlation",
+                                "The spatial correlation module is not available.\n\nPut dendro_field.py and "
+                                "dendro_field_qt.py into the dendro_modules folder.\n\n" + _FIELD_IMPORT_ERROR)
+            return
+        panel = getattr(self, "_field_panel", None)
+        if panel is not None:
+            panel.refresh_from_host()
+            dock = getattr(self, "_field_dock", None)
+            if dock is not None:
+                dock.show()
+            else:
+                panel.show()
+                panel.raise_()
+            return
+        panel = _field_qt.FieldCorrelationPanel(self)
+        self._field_panel = panel
+        self._field_dock = None
+
+        def _closed() -> None:
+            self._field_dock = None
+            p = getattr(self, "_field_panel", None)
+            self._field_panel = None
+            if p is not None:
+                p.deleteLater()
+
+        if _uihelp is not None and hasattr(_uihelp, "QtTabDock"):
+            self._field_dock = _uihelp.QtTabDock(self.tabs, panel, "Spatial correlation", on_closed=_closed)
+            panel.set_dock(self._field_dock)
+            self._field_dock.attach()
+        else:
+            panel.setParent(self, Qt.Window)
+            panel.resize(1300, 850)
+            panel.show()
+
+    # ---- Moving correlation page ----
+    def open_moving_panel(self) -> None:
+        """Open (or show) the moving correlation page; by default it is a tab of the main window."""
+        if _moving_qt is None:
+            QMessageBox.warning(self, "Moving correlation",
+                                "The moving correlation module is not available.\n\nPut dendro_moving.py and "
+                                "dendro_moving_qt.py into the dendro_modules folder.\n\n" + _MOVING_IMPORT_ERROR)
+            return
+        panel = getattr(self, "_moving_panel", None)
+        if panel is not None:
+            panel.refresh_from_host()
+            dock = getattr(self, "_moving_dock", None)
+            if dock is not None:
+                dock.show()
+            else:
+                panel.show()
+                panel.raise_()
+            return
+        panel = _moving_qt.MovingCorrelationPanel(self)
+        self._moving_panel = panel
+        self._moving_dock = None
+
+        def _closed() -> None:
+            self._moving_dock = None
+            p = getattr(self, "_moving_panel", None)
+            self._moving_panel = None
+            if p is not None:
+                p.deleteLater()
+
+        if _uihelp is not None and hasattr(_uihelp, "QtTabDock"):
+            self._moving_dock = _uihelp.QtTabDock(self.tabs, panel, "Moving correlation", on_closed=_closed)
+            panel.set_dock(self._moving_dock)
+            self._moving_dock.attach()
+        else:
+            panel.setParent(self, Qt.Window)
+            panel.resize(1300, 850)
+            panel.show()
+
+    def moving_chronologies(self) -> List[dict]:
+        out = []
+        for c in self.field_chronologies():
+            ds = c["dataset"]
+            name = c["name"]
+            col = name[len(ds.name) + 2:-1] if name.startswith(ds.name + " [") else (
+                (ds.value_columns or [""])[0] if len(ds.value_columns or []) == 1 else "")
+            out.append({"name": name, "dataset": ds.name, "column": col, "series": c["series"],
+                        "lat": c.get("lat"), "lon": c.get("lon")})
+        return out
+
+    def moving_climates(self) -> dict:
+        """name -> dict(monthly=DataFrame year x 1..12 | None, annual=Series | None, param=str)."""
+        out = {}
+        for ds in self.datasets:
+            if getattr(ds, "kind", "") != "climate":
+                continue
+            try:
+                df = ds.df
+                ycol = ds.year_col if ds.year_col in df.columns else df.columns[0]
+                years = pd.to_numeric(df[ycol], errors="coerce")
+                mcols = [c for c in (ds.month_columns or []) if c in df.columns]
+                if len(mcols) != 12:
+                    continue
+                tab = _replace_sentinel_missing(df, mcols)[mcols].apply(pd.to_numeric, errors="coerce")
+                tab.index = years.values
+                tab = tab[~pd.isna(tab.index)]
+                tab.index = tab.index.astype(int)
+                tab = tab.groupby(level=0).mean()
+                tab.columns = list(range(1, 13))
+                out[ds.name] = {"monthly": tab, "annual": None,
+                                "param": getattr(ds, "climate_param", "Other") or "Other"}
+            except Exception:
+                continue
+        return out
+
+    def _chronology_series(self, ds: "DataSet") -> List[tuple]:
+        """[(label, pd.Series year->value)] of a chronology dataset (one per value column)."""
+        out = []
+        try:
+            df = ds.df
+            ycol = ds.year_col if ds.year_col in df.columns else df.columns[0]
+            years = pd.to_numeric(df[ycol], errors="coerce")
+            cols = [c for c in (ds.value_columns or []) if c in df.columns and c != ycol]
+            if len(cols) > 8:   # RWI tables with many series: not a chronology
+                return []
+            for c in cols:
+                s = pd.Series(pd.to_numeric(df[c], errors="coerce").values, index=years.values).dropna()
+                s = s[~s.index.isna()]
+                s.index = s.index.astype(int)
+                if len(s) >= 10:
+                    out.append((ds.name if len(cols) == 1 else f"{ds.name} [{c}]", s))
+        except Exception:
+            pass
+        return out
+
+    def field_chronologies(self) -> List[dict]:
+        out = []
+        for ds in self.datasets:
+            if getattr(ds, "kind", "") != "chronology":
+                continue
+            meta = getattr(ds, "meta", None) or {}
+            for label, s in self._chronology_series(ds):
+                out.append({"name": label, "series": s, "lat": meta.get("lat"), "lon": meta.get("lon"),
+                            "site": meta.get("site_code") or "", "dataset": ds})
+        return out
+
+    def field_climate_info(self) -> dict:
+        out = {}
+        if _field is None:
+            return out
+        for ds in self.datasets:
+            if getattr(ds, "kind", "") not in ("climate", "timeseries"):
+                continue
+            meta = getattr(ds, "meta", None) or {}
+            rng = self._get_dataset_year_range_safe(ds) if hasattr(self, "_get_dataset_year_range_safe") else None
+            out[ds.name] = _field.ClimateInfo(ds.name, getattr(ds, "climate_param", "Other") or "Other",
+                                              str(meta.get("source", "") or meta.get("dataset", "")),
+                                              str(meta.get("variable", "") or ""),
+                                              rng[0] if rng else None, rng[1] if rng else None)
+        return out
+
+    def field_period(self):
+        """Year range of the Analysis tab (used for map and moving-correlation suggestions)."""
+        try:
+            return int(self.spin_year_start.value()), int(self.spin_year_end.value())
+        except Exception:
+            return None
+
+    def field_results(self):
+        return getattr(self, "result_df", None)
+
+    def field_set_location(self, name: str, lat: float, lon: float) -> None:
+        for ds in self.datasets:
+            if getattr(ds, "kind", "") != "chronology":
+                continue
+            if ds.name == name or name.startswith(ds.name + " ["):
+                meta = dict(getattr(ds, "meta", None) or {})
+                meta["lat"], meta["lon"] = float(lat), float(lon)
+                meta.setdefault("source", "typed by the user")
+                setattr(ds, "meta", meta)
+        self._push_chronology_locations()
+
+    def chronology_locations(self) -> List[tuple]:
+        """(name, lat, lon) of every chronology with coordinates in its metadata (one per location)."""
+        out: List[tuple] = []
+        seen = set()
+        for ds in self.datasets:
+            if getattr(ds, "kind", "") != "chronology":
+                continue
+            meta = getattr(ds, "meta", None) or {}
+            lat, lon = meta.get("lat"), meta.get("lon")
+            if lat is None or lon is None:
+                continue
+            try:
+                lat, lon = float(lat), float(lon)
+            except (TypeError, ValueError):
+                continue
+            key = (round(lat, 4), round(lon, 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            name = str(meta.get("site_code") or "").strip() or str(ds.name).split("|")[0].strip()
+            out.append((name, lat, lon))
+        return out
+
+    def _push_chronology_locations(self) -> None:
+        dlg = getattr(self, "_online_dialog", None)
+        if dlg is not None and hasattr(dlg, "set_chronology_locations"):
+            try:
+                dlg.set_chronology_locations(self.chronology_locations())
+            except Exception:
+                pass
+        for attr in ("_field_panel", "_moving_panel"):
+            fc = getattr(self, attr, None)
+            if fc is not None and hasattr(fc, "refresh_from_host"):
+                try:
+                    fc.refresh_from_host()
+                except Exception:
+                    pass
+
+    def _on_online_settings_changed(self, settings: dict) -> None:
+        self.online_settings = dict(settings or {})
+
+    def _on_online_dialog_closed(self, *args) -> None:
+        dlg = self._online_dialog
+        if dlg is not None:
+            try:
+                self.online_settings = dlg.get_settings()
+            except Exception:
+                pass
+            dlg.deleteLater()
+        self._online_dialog = None
+        self._online_dock = None
+
+    def _add_online_datasets(self, entries: list) -> None:
+        """Receive datasets from the online dialog and add them to the project."""
+        added = 0
+        for e in entries or []:
+            try:
+                df = e["df"].copy()
+                kind = e.get("kind", "climate")
+                ds = DataSet(name=e["name"], path=e.get("path", ""), df=df, kind=kind)
+                ds.year_col = "Year"
+                if kind == "climate":
+                    ds.month_columns = list(MONTH_NAMES)
+                    ds.climate_param = e.get("climate_param", "Other")
+                elif kind == "timeseries":  # daily series (CHELSA daily, CHIRPS, GHCN-Daily, ERA5 ...)
+                    ds.year_col = "DateTime"
+                    ds.value_columns = ["Value"]
+                    ds.month_columns = []
+                    ds.climate_param = e.get("climate_param", "Other")
+                    setattr(ds, "source_freq", e.get("source_freq", "daily"))
+                else:
+                    ds.value_columns = [e.get("value_column") or [c for c in df.columns if c != "Year"][0]]
+                if e.get("monthly_agg"):
+                    setattr(ds, "monthly_agg", e.get("monthly_agg"))
+                setattr(ds, "meta", e.get("meta"))
+                self.datasets.append(ds)
+                if kind == "timeseries":
+                    label = f"{ds.name} (timeseries: {getattr(ds, 'source_freq', 'daily')})"
+                else:
+                    label = self._format_dataset_label(ds, include_kind=(kind == "climate"))
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, ds)
+                item.setToolTip(str((e.get("meta") or {}).get("warning", "")) or e.get("path", ""))
+                self.list_datasets.addItem(item)
+                added += 1
+            except Exception as exc:
+                QMessageBox.warning(self, "Online data", f"Could not add {e.get('name', 'dataset')}:\n{exc}")
+        if added:
+            self.refresh_analysis_lists()
+            self._refresh_loaded_dataset_list_labels()
+            self.statusBar().showMessage(f"Online data: {added} dataset(s) added", 8000)
+            # Batch download ("Download everything for the area"): select all new datasets for the analysis
+            batch = [e for e in entries or [] if (e.get("meta") or {}).get("select_for_analysis")]
+            if batch:
+                self._select_new_datasets_for_analysis(len(batch))
+
+    def _select_new_datasets_for_analysis(self, n_new: int) -> None:
+        """Select the last n_new datasets in the Analysis lists and show the Analysis tab."""
+        new = set(id(ds) for ds in self.datasets[-n_new:])
+        try:
+            for lst in (self.list_chron_for_analysis, self.list_climate_for_analysis):
+                lst.clearSelection()
+                for i in range(lst.count()):
+                    it = lst.item(i)
+                    ds = it.data(Qt.UserRole)
+                    if ds is not None and id(ds) in new:
+                        it.setSelected(True)
+            # keep the user's chronologies selected when the batch brought none
+            if not self.list_chron_for_analysis.selectedItems():
+                for i in range(self.list_chron_for_analysis.count()):
+                    self.list_chron_for_analysis.item(i).setSelected(True)
+            self.tabs.setCurrentWidget(self.tab_analysis)
+            self.statusBar().showMessage(
+                f"Batch: {n_new} dataset(s) added and selected - press 'Run analysis'", 12000)
+        except Exception:
+            pass
+
     # ---- Analysis tab ----
     def _init_tab_analysis(self):
         layout = QVBoxLayout()
 
-        target_h = QHBoxLayout()
+        target_h = FlowLayout(spacing=8)  # wraps on narrow screens
         target_h.addWidget(QLabel("Correlation target:"))
         self.combo_analysis_target = QComboBox()
         self.combo_analysis_target.addItems(["Chronology × Climate", "Chronology × Chronology"])
@@ -6819,7 +8964,6 @@ class MainWindow(QMainWindow):
         )
         self.combo_analysis_target.currentIndexChanged.connect(self._on_analysis_target_changed)
         target_h.addWidget(self.combo_analysis_target)
-        target_h.addSpacing(12)
         target_h.addWidget(QLabel("Resolution:"))
         self.combo_analysis_resolution = QComboBox()
         self.combo_analysis_resolution.addItems(["Monthly", "Daily"])
@@ -6829,7 +8973,6 @@ class MainWindow(QMainWindow):
         self.combo_analysis_resolution.currentIndexChanged.connect(self._on_analysis_resolution_changed)
         target_h.addWidget(self.combo_analysis_resolution)
 
-        target_h.addSpacing(18)
         self.btn_select_all_targets = QPushButton("Select all")
         self.btn_select_all_targets.setToolTip("Select all items in the climate/target list.")
         self.btn_select_all_targets.clicked.connect(
@@ -6838,10 +8981,8 @@ class MainWindow(QMainWindow):
         target_h.addWidget(self.btn_select_all_targets)
 
         self.btn_clear_targets = QPushButton("Clear selection")
-        self.btn_clear_targets.setToolTip("Clear selection in the climate/target list.")
-        self.btn_clear_targets.clicked.connect(
-            lambda: self.list_climate_for_analysis.clearSelection()
-        )
+        self.btn_clear_targets.setToolTip("Clear the selection in both lists (chronologies and climate/targets).")
+        self.btn_clear_targets.clicked.connect(self._clear_analysis_selection)
         target_h.addWidget(self.btn_clear_targets)
 
         self.btn_preview_selected = QPushButton("Preview selected dataset")
@@ -6849,42 +8990,42 @@ class MainWindow(QMainWindow):
         self.btn_preview_selected.clicked.connect(self.preview_selected_dataset)
         target_h.addWidget(self.btn_preview_selected)
 
-        self.btn_run_analysis_top = QPushButton("Run analysis")
+        self.btn_run_analysis_top = PrimaryButton("Run analysis")
         self.btn_run_analysis_top.setMinimumHeight(34)
         _run_font_top = QFont(self.btn_run_analysis_top.font())
         _run_font_top.setBold(True)
         self.btn_run_analysis_top.setFont(_run_font_top)
-        self.btn_run_analysis_top.setStyleSheet(
-            "QPushButton { padding: 4px 14px; font-weight: 700; }"
-        )
+        self.btn_run_analysis_top.setProperty("primary", True)
+        self.btn_run_analysis_top.setToolTip("Compute all correlations for the selected datasets and settings.")
         self.btn_run_analysis_top.clicked.connect(self.run_analysis)
         target_h.addWidget(self.btn_run_analysis_top)
 
-        target_h.addStretch(1)
-        layout.addLayout(target_h)
+        layout.addWidget(FlowBar(target_h))
 
-        scroll_host = QWidget()
-        scroll_layout = QVBoxLayout(scroll_host)
-        scroll_layout.setContentsMargins(0, 0, 0, 0)
-        scroll_layout.setSpacing(8)
-
+        # ---- data lists (large, resizable) ----
         group_sets = QGroupBox("Select data for analysis")
         g_layout = QHBoxLayout()
+        g_layout.setContentsMargins(6, 6, 6, 6)
+        g_layout.setSpacing(10)
         self.list_chron_for_analysis = QListWidget()
         self.list_chron_for_analysis.setSelectionMode(QAbstractItemView.MultiSelection)
         self.list_climate_for_analysis = QListWidget()
         self.list_climate_for_analysis.setSelectionMode(QAbstractItemView.MultiSelection)
-        g_layout.addWidget(self._wrap_with_label("Chronologies (A)", self.list_chron_for_analysis))
-
+        for lw in (self.list_chron_for_analysis, self.list_climate_for_analysis):
+            lw.setMinimumHeight(140)
+            lw.setAlternatingRowColors(True)
+            lw.setUniformItemSizes(True)
+        g_layout.addWidget(self._analysis_list_panel(QLabel("Chronologies (A)"), self.list_chron_for_analysis), 1)
         self._label_target_list = QLabel("Climate datasets")
-        self._wrap_target_list = QWidget()
-        _t_lay = QVBoxLayout()
-        _t_lay.addWidget(self._label_target_list)
-        _t_lay.addWidget(self.list_climate_for_analysis)
-        self._wrap_target_list.setLayout(_t_lay)
-        g_layout.addWidget(self._wrap_target_list)
+        self._wrap_target_list = self._analysis_list_panel(self._label_target_list, self.list_climate_for_analysis)
+        g_layout.addWidget(self._wrap_target_list, 1)
         group_sets.setLayout(g_layout)
-        scroll_layout.addWidget(group_sets)
+
+        # ---- compact parameter area ----
+        params_host = QWidget()
+        params_lay = QVBoxLayout(params_host)
+        params_lay.setContentsMargins(0, 0, 0, 0)
+        params_lay.setSpacing(4)
 
         ts_h = QHBoxLayout()
         self.lbl_timeseries_agg = QLabel("Daily/hourly → monthly:")
@@ -6901,64 +9042,54 @@ class MainWindow(QMainWindow):
         )
         self.btn_preview_timeseries_monthly.clicked.connect(self.preview_selected_timeseries_monthly)
         ts_h.addWidget(self.btn_preview_timeseries_monthly)
-        ts_h.addStretch(1)
-        scroll_layout.addLayout(ts_h)
-
-        preview_h = QHBoxLayout()
+        ts_h.addSpacing(12)
         self.lbl_selected_periods = QLabel("")
+        self.lbl_selected_periods.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.lbl_selected_periods.setWordWrap(True)
-        self.lbl_selected_periods.setMinimumWidth(320)
-        preview_h.addWidget(self.lbl_selected_periods, 1)
-        scroll_layout.addLayout(preview_h)
+        self.lbl_selected_periods.setStyleSheet("color: #52514e;")
+        ts_h.addWidget(self.lbl_selected_periods, 1)
+        params_lay.addLayout(ts_h)
+
+        def _spin(lo: int, hi: int, val: int, tip: str, width: int = 80) -> QSpinBox:
+            sp = QSpinBox()
+            sp.setRange(lo, hi)
+            sp.setValue(val)
+            sp.setToolTip(tip)
+            sp.setMaximumWidth(width)
+            return sp
+
+        def _pair(*widgets) -> QWidget:
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            for x in widgets:
+                h.addWidget(QLabel(x) if isinstance(x, str) else x)
+            h.addStretch(1)
+            return w
 
         group_params = QGroupBox("Analysis parameters")
-        p_layout = QHBoxLayout()
         group_params.setStyleSheet(
             "QGroupBox { font-weight: 700; } "
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
         )
-        p_layout.setContentsMargins(8, 8, 8, 8)
-        p_layout.setSpacing(8)
+        p_layout = QHBoxLayout()
+        p_layout.setContentsMargins(8, 6, 8, 6)
+        p_layout.setSpacing(16)
 
-        # Years (only create spin boxes here; they will be placed into layouts below)
-        self.spin_year_start = QSpinBox()
-        self.spin_year_start.setRange(-9999, 9999)
-        self.spin_year_start.setValue(1900)
-        self.spin_year_start.setToolTip(
-            "Start year for the analysis. Only overlapping data inside the selected year range will be used."
+        # column 1: what is correlated
+        self.spin_year_start = _spin(-9999, 9999, 1900, "Start year for the analysis. Only overlapping data inside the selected year range will be used.")
+        self.spin_year_end = _spin(-9999, 9999, 2020, "End year for the analysis. Only overlapping data inside the selected year range will be used.")
+        self.chk_common_period = QCheckBox("common period")
+        self.chk_common_period.setToolTip(
+            "When checked, year range will be set to the overlapping years "
+            "across all selected chronology and climate datasets."
         )
-        self.spin_year_end = QSpinBox()
-        self.spin_year_end.setRange(-9999, 9999)
-        self.spin_year_end.setValue(2020)
-        self.spin_year_end.setToolTip(
-            "End year for the analysis. Only overlapping data inside the selected year range will be used."
-        )
-
-        # Window lengths
-        self.spin_min_len = QSpinBox()
-
-        # Window lengths
-        self.spin_min_len = QSpinBox()
-        self.spin_min_len.setRange(1, 24)
-        self.spin_min_len.setValue(1)
-        self.spin_min_len.setToolTip(
-            "Shortest climate window length in months."
-        )
-        self.spin_max_len = QSpinBox()
-        self.spin_max_len.setRange(1, 24)
-        self.spin_max_len.setValue(24)
-        self.spin_max_len.setToolTip(
-            "Longest climate window length in months."
-        )
-
-        # correlation method
+        self.spin_min_len = _spin(1, 24, 1, "Shortest climate window length in months.", 60)
+        self.spin_max_len = _spin(1, 24, 24, "Longest climate window length in months.", 60)
         self.combo_corr = QComboBox()
         self.combo_corr.addItems(["pearson", "spearman"])
-        self.combo_corr.setToolTip(
-            "Correlation method used to compare chronology values with climate windows."
-        )
-
-        # aggregation choice
+        self.combo_corr.setToolTip("Correlation method used to compare chronology values with climate windows.")
         self.combo_agg = QComboBox()
         self.combo_agg.addItems(["Auto (by variable)", "sum", "mean", "sum/2", "both"])
         self.combo_agg.setCurrentText("Auto (by variable)")
@@ -6970,239 +9101,60 @@ class MainWindow(QMainWindow):
             "sum/2: sum then divide by 2 for all windows.\n"
             "both: compute both sum and mean."
         )
-
-        # Season filter block
-        season_layout = QVBoxLayout()
-        season_layout.setContentsMargins(0, 0, 0, 0)
-        season_layout.setSpacing(2)
-        lbl_season_filter = QLabel("Season filter (only windows fully inside season):")
-        lbl_season_filter.setStyleSheet("font-weight: 700;")
-        season_layout.addWidget(lbl_season_filter)
+        self.spin_min_n = _spin(3, 500, 15,
+                                "Correlations computed from fewer common years than this are skipped. Short station records "
+                                "otherwise produce very high but meaningless correlations (e.g. r = 0.99 with n = 3).", 70)
+        self.chk_exclude_single = QCheckBox("Exclude single-month windows")
+        self.chk_exclude_single.setChecked(False)
+        self.chk_exclude_single.setToolTip("Skip one-month windows such as pJan or Jan and keep only multi-month windows.")
         self.combo_season = QComboBox()
         self.combo_season.addItems(["All months", "Apr-Sep", "Oct-Mar", "Custom"])
         self.combo_season.setCurrentText("All months")
-        self.combo_season.setToolTip(
-            "Limit analysis to windows fully contained inside the selected season."
-        )
-        season_layout.addWidget(self.combo_season)
-        custom_h = QHBoxLayout()
-        custom_h.setContentsMargins(0, 0, 0, 0)
-        custom_h.setSpacing(6)
-        custom_h.addWidget(QLabel("Start month:"))
-        self.spin_season_start = QSpinBox()
-        self.spin_season_start.setRange(1, 12)
-        self.spin_season_start.setValue(1)   # default 1
-        self.spin_season_start.setToolTip(
-            "Custom season start month."
-        )
-        custom_h.addWidget(self.spin_season_start)
-        custom_h.addWidget(QLabel("End month:"))
-        self.spin_season_end = QSpinBox()
-        self.spin_season_end.setRange(1, 12)
-        self.spin_season_end.setValue(12)    # default 12
-        self.spin_season_end.setToolTip(
-            "Custom season end month."
-        )
-        custom_h.addWidget(self.spin_season_end)
-        season_layout.addLayout(custom_h)
+        self.combo_season.setToolTip("Limit analysis to windows fully contained inside the selected season.")
+        self.spin_season_start = _spin(1, 12, 1, "Custom season start month.", 55)
+        self.spin_season_end = _spin(1, 12, 12, "Custom season end month.", 55)
 
-        p_layout_left = QVBoxLayout()
-        p_layout_left.setSpacing(4)
+        for cb in (self.combo_agg, self.combo_corr):
+            cb.setMaximumWidth(240)
+        col1 = QFormLayout()
+        col1.setLabelAlignment(Qt.AlignRight)
+        col1.setVerticalSpacing(4)
+        col1.addRow("Years:", _pair(self.spin_year_start, "–", self.spin_year_end, self.chk_common_period))
+        col1.addRow("Window length:", _pair(self.spin_min_len, "–", self.spin_max_len, "months"))
+        col1.addRow("Aggregation:", self.combo_agg)
+        col1.addRow("Correlation:", self.combo_corr)
+        col1.addRow("Min. years (n):", _pair(self.spin_min_n, self.chk_exclude_single))
+        col1.addRow("Season filter:", _pair(self.combo_season, self.spin_season_start, "–", self.spin_season_end))
+        p_layout.addLayout(col1, 3)
 
-        year_box = QGroupBox("Year range")
-        ylay = QHBoxLayout()
-        ylay.addWidget(QLabel("Year start / Year end:"))
-        ylay.addWidget(self.spin_year_start)
-        ylay.addWidget(self.spin_year_end)
-        year_box.setLayout(ylay)
-
-        # Optional: restrict analysis to common period across selected datasets
-        self.chk_common_period = QCheckBox("")
-        self.chk_common_period.setToolTip(
-            "When checked, year range will be set to the overlapping years "
-            "across all selected chronology and climate datasets."
-        )
-
-        p_layout_mid = QVBoxLayout()
-        p_layout_mid.setSpacing(4)
-        p_layout_mid.addWidget(year_box)
-        p_layout_mid.addWidget(self.chk_common_period)
-        p_layout_mid.addWidget(QLabel("Min window length (months):"))
-        p_layout_mid.addWidget(self.spin_min_len)
-        p_layout_mid.addWidget(QLabel("Max window length (months):"))
-        p_layout_mid.addWidget(self.spin_max_len)
-        p_layout_mid.addWidget(QLabel("Aggregation:"))
-        p_layout_mid.addWidget(self.combo_agg)
-
-        # Top-N controls
-        p_layout_mid.addWidget(QLabel("Show only top N correlations:"))
-        top_h = QHBoxLayout()
-        self.spin_top_n = QSpinBox()
-        self.spin_top_n.setRange(0, 100000)
-        self.spin_top_n.setValue(0)
-        self.spin_top_n.setToolTip(
-            "Show only the strongest N correlations. Use 0 to keep all rows."
-        )
-        top_h.addWidget(self.spin_top_n)
+        # column 2: result size and missing values
+        self.spin_top_n = _spin(0, 100000, 0, "Show only the strongest N correlations. Use 0 to keep all rows.")
         self.combo_top_mode = QComboBox()
         self.combo_top_mode.addItems(["Overall (top N)", "Per pair (top N per pair)"])
         self.combo_top_mode.setCurrentText("Per pair (top N per pair)")
         self.combo_top_mode.setToolTip(
             "Choose whether top-N filtering is applied globally or separately for each chronology-climate pair."
         )
-        top_h.addWidget(self.combo_top_mode)
-        p_layout_mid.addLayout(top_h)
-
-        p_layout_mid.addWidget(QLabel("Report: top K rows per pair (0 = default 10):"))
-        self.spin_report_k = QSpinBox()
-        self.spin_report_k.setRange(0, 1000)
-        self.spin_report_k.setValue(10)
-        self.spin_report_k.setToolTip(
-            "How many strongest rows per pair are included in the compact report. Use 0 for the default value 10."
-        )
-        p_layout_mid.addWidget(self.spin_report_k)
-
-        # Exclude single-month
-        p_layout_mid.addWidget(QLabel("Exclude single-month windows (skip windows where start == end):"))
-        self.chk_exclude_single = QCheckBox("Exclude single-month windows")
-        self.chk_exclude_single.setChecked(False)
-        self.chk_exclude_single.setToolTip(
-            "Skip one-month windows such as pJan or Jan and keep only multi-month windows."
-        )
-        p_layout_mid.addWidget(self.chk_exclude_single)
-
-        # --- NEW: multi-year periods ---
-        period_group = QGroupBox("Multi-year period analysis")
-        period_layout = QVBoxLayout()
-        period_layout.setSpacing(4)
-        self.chk_enable_periods = QCheckBox("Enable multi-year period analysis")
-        self.chk_enable_periods.setChecked(False)
-        self.chk_enable_periods.setToolTip(
-            "When enabled, correlations are also computed over multiple sub-periods using the settings below."
-        )
-        period_layout.addWidget(self.chk_enable_periods)
-
-        min_span_layout = QHBoxLayout()
-        min_span_layout.addWidget(QLabel("Minimal period span (years):"))
-        self.spin_period_min_span = QSpinBox()
-        self.spin_period_min_span.setRange(2, 500)
-        self.spin_period_min_span.setValue(50)
-        self.spin_period_min_span.setToolTip(
-            "Minimal period span (years). In Anchored/Grid modes this is the minimum allowed length; "
-            "in Sliding it is also the fixed window length."
-        )
-        min_span_layout.addWidget(self.spin_period_min_span)
-        period_layout.addLayout(min_span_layout)
-
-        step_layout = QHBoxLayout()
-        step_layout.addWidget(QLabel("Step between periods (years):"))
-        self.spin_period_step = QSpinBox()
-        self.spin_period_step.setRange(1, 100)
-        self.spin_period_step.setValue(5)
-        self.spin_period_step.setToolTip(
-            "Step (years) for shifting period boundaries: Anchored trims edges by this step; "
-            "Sliding moves fixed-length windows by this step; Grid uses it as the start/end grid step."
-        )
-        step_layout.addWidget(self.spin_period_step)
-        period_layout.addLayout(step_layout)
-
-        min_pts_layout = QHBoxLayout()
-        min_pts_layout.addWidget(QLabel("Minimal data points inside period:"))
-        self.spin_min_period_points = QSpinBox()
-        self.spin_min_period_points.setRange(5, 5000)
-        self.spin_min_period_points.setValue(10)
-        self.spin_min_period_points.setToolTip(
-            "Minimal number of non-missing observations required inside the period to compute correlation."
-        )
-        period_layout.addLayout(min_pts_layout)
-
-        mode_group = QGroupBox("Period mode")
-        mode_layout = QVBoxLayout()
-        self.radio_period_anchored = QRadioButton("Anchored")
-        self.radio_period_sliding = QRadioButton("Sliding fixed length")
-        self.radio_period_grid = QRadioButton("Exhaustive grid (experimental)")
-        self.radio_period_anchored.setChecked(True)
-        self.radio_period_anchored.setToolTip(
-            "Anchored mode: trim from the earliest/latest side by the chosen step until the minimal span is reached "
-            "(e.g., 1910–Ymax, 1920–Ymax, and Ymin–1990, Ymin–1980, ...)."
-        )
-        self.radio_period_sliding.setToolTip(
-            "Sliding mode: use a fixed length equal to Minimal period span and slide the window by the step."
-        )
-        self.radio_period_grid.setToolTip(
-            "Exhaustive mode: start/end grid with the given step; only intervals of at least the minimal span are kept "
-            "(may be slow)."
-        )
-        self.period_mode_group = QButtonGroup(self)
-        for rb in (self.radio_period_anchored, self.radio_period_sliding, self.radio_period_grid):
-            self.period_mode_group.addButton(rb)
-            mode_layout.addWidget(rb)
-        mode_group.setLayout(mode_layout)
-        period_layout.addWidget(mode_group)
-        period_group.setLayout(period_layout)
-        p_layout_mid.addWidget(period_group)
-        # --- END NEW ---
-
-        p_layout_right = QVBoxLayout()
-        p_layout_right.setContentsMargins(0, 0, 0, 0)
-        p_layout_right.setSpacing(4)
-        p_layout_right.setAlignment(Qt.AlignTop)
-
-        corr_layout = QVBoxLayout()
-        corr_layout.setContentsMargins(0, 0, 0, 0)
-        corr_layout.setSpacing(2)
-        lbl_corr_method = QLabel("Correlation method:")
-        lbl_corr_method.setStyleSheet("font-weight: 700;")
-        corr_layout.addWidget(lbl_corr_method)
-        corr_layout.addWidget(self.combo_corr)
-        p_layout_right.addLayout(corr_layout)
- 
-        missing_box = QGroupBox("Missing values (climate)")
-        missing_lay = QVBoxLayout()
-        missing_lay.setSpacing(4)
-
-        self.radio_missing_ignore = QRadioButton("Ignore missing (use available months)")
+        self.spin_report_k = _spin(0, 1000, 10,
+                                   "How many strongest rows per pair are included in the compact report. Use 0 for the default value 10.")
+        self.radio_missing_ignore = QRadioButton("Ignore (use available months)")
         self.radio_missing_ignore.setChecked(True)
-        self.radio_missing_ignore.setToolTip(
-            "Use available monthly values in each window and ignore missing months."
-        )
-        self.radio_missing_strict = QRadioButton("Strict: drop windows with any missing value")
-        self.radio_missing_strict.setToolTip(
-            "Drop a climate window for that year if any month inside the window is missing."
-        )
-        self.radio_missing_fill_mean = QRadioButton("Fill missing with monthly mean (per station)")
-        self.radio_missing_fill_mean.setToolTip(
-            "Replace missing values by the long-term mean of the same calendar month."
-        )
-        self.radio_missing_local = QRadioButton("Fill missing with local window mean (±K years, per month)")
-        self.radio_missing_local.setToolTip(
-            "Replace missing values using nearby years of the same month. Controlled by K."
-        )
-        self.radio_missing_interp_limited = QRadioButton("Linear interpolation (only if gap ≤ N years, per month)")
+        self.radio_missing_strict = QRadioButton("Strict: drop windows with a gap")
+        self.radio_missing_strict.setToolTip("Drop a climate window for that year if any month inside the window is missing.")
+        self.radio_missing_fill_mean = QRadioButton("Fill with monthly mean")
+        self.radio_missing_fill_mean.setToolTip("Replace missing values by the long-term mean of the same calendar month.")
+        self.radio_missing_local = QRadioButton("Local mean ±K years")
+        self.radio_missing_local.setToolTip("Replace missing values using nearby years of the same month. Controlled by K.")
+        self.radio_missing_interp_limited = QRadioButton("Interpolate gaps ≤ N years")
         self.radio_missing_interp_limited.setToolTip(
             "Linearly interpolate interior gaps for the same month when the gap length does not exceed N."
         )
-
-        self.spin_missing_local_k = QSpinBox()
-        self.spin_missing_local_k.setRange(1, 100)
-        self.spin_missing_local_k.setValue(5)
-        self.spin_missing_local_k.setFixedWidth(70)
-        self.spin_missing_local_k.setAlignment(Qt.AlignCenter)
-        self.spin_missing_local_k.setToolTip(
-            "K controls the local window fill: the algorithm collects up to K valid values before and K after a missing year (per month). "
-            "Missing values are skipped; the search continues outward. A value is filled only if at least K valid values are found in total."
-        )
-
-        self.spin_missing_interp_gap = QSpinBox()
-        self.spin_missing_interp_gap.setRange(1, 100)
-        self.spin_missing_interp_gap.setValue(3)
-        self.spin_missing_interp_gap.setFixedWidth(70)
-        self.spin_missing_interp_gap.setAlignment(Qt.AlignCenter)
-        self.spin_missing_interp_gap.setToolTip(
-            "N controls linear interpolation: only interior gaps with at most N consecutive missing points are filled (per month). "
-            "Leading/trailing missing values remain missing."
-        )
-
+        self.spin_missing_local_k = _spin(1, 100, 5,
+                                          "K controls the local window fill: the algorithm collects up to K valid values before and K after a missing year (per month). "
+                                          "Missing values are skipped; the search continues outward. A value is filled only if at least K valid values are found in total.", 55)
+        self.spin_missing_interp_gap = _spin(1, 100, 3,
+                                             "N controls linear interpolation: only interior gaps with at most N consecutive missing points are filled (per month). "
+                                             "Leading/trailing missing values remain missing.", 55)
         self.radio_missing_ignore.setToolTip(
             "How missing values in monthly climate data are handled.\n"
             "Sentinels like -999 are treated as missing.\n"
@@ -7212,70 +9164,119 @@ class MainWindow(QMainWindow):
             "- Local mean: replace NaNs with the mean of nearby years for the same month (uses K).\n"
             "- Linear: fill interior gaps by linear interpolation if the gap length is ≤ N."
         )
-
         self._missing_group = QButtonGroup(self)
-        for rb in (
-            self.radio_missing_ignore,
-            self.radio_missing_strict,
-            self.radio_missing_fill_mean,
-            self.radio_missing_local,
-            self.radio_missing_interp_limited,
-        ):
+        for rb in (self.radio_missing_ignore, self.radio_missing_strict, self.radio_missing_fill_mean,
+                   self.radio_missing_local, self.radio_missing_interp_limited):
             self._missing_group.addButton(rb)
-
-        missing_lay.addWidget(self.radio_missing_ignore)
-        missing_lay.addWidget(self.radio_missing_strict)
-        missing_lay.addWidget(self.radio_missing_fill_mean)
-
-        h_local = QHBoxLayout()
-        h_local.addWidget(self.radio_missing_local)
-        h_local.addStretch(1)
-        h_local.addWidget(QLabel("K:"))
-        h_local.addWidget(self.spin_missing_local_k)
-        h_local.addWidget(QLabel("years"))
-        missing_lay.addLayout(h_local)
-
-        h_interp = QHBoxLayout()
-        h_interp.addWidget(self.radio_missing_interp_limited)
-        h_interp.addStretch(1)
-        h_interp.addWidget(QLabel("N:"))
-        h_interp.addWidget(self.spin_missing_interp_gap)
-        h_interp.addWidget(QLabel("years"))
-        missing_lay.addLayout(h_interp)
+        missing_box = QWidget()
+        mg = QGridLayout(missing_box)
+        mg.setContentsMargins(0, 0, 0, 0)
+        mg.setHorizontalSpacing(8)
+        mg.setVerticalSpacing(2)
+        mg.addWidget(self.radio_missing_ignore, 0, 0)
+        mg.addWidget(self.radio_missing_strict, 0, 1)
+        mg.addWidget(self.radio_missing_fill_mean, 1, 0)
+        mg.addWidget(_pair(self.radio_missing_local, self.spin_missing_local_k), 1, 1)
+        mg.addWidget(_pair(self.radio_missing_interp_limited, self.spin_missing_interp_gap), 2, 0, 1, 2)
 
         def _update_missing_controls():
             self.spin_missing_local_k.setEnabled(self.radio_missing_local.isChecked())
             self.spin_missing_interp_gap.setEnabled(self.radio_missing_interp_limited.isChecked())
 
-        for rb in (
-            self.radio_missing_ignore,
-            self.radio_missing_strict,
-            self.radio_missing_fill_mean,
-            self.radio_missing_local,
-            self.radio_missing_interp_limited,
-        ):
+        for rb in (self.radio_missing_ignore, self.radio_missing_strict, self.radio_missing_fill_mean,
+                   self.radio_missing_local, self.radio_missing_interp_limited):
             rb.toggled.connect(_update_missing_controls)
-
         _update_missing_controls()
 
-        missing_box.setLayout(missing_lay)
-        p_layout_right.addWidget(missing_box)
+        col2 = QFormLayout()
+        col2.setLabelAlignment(Qt.AlignRight)
+        col2.setVerticalSpacing(4)
+        col2.addRow("Show top N:", _pair(self.spin_top_n, self.combo_top_mode))
+        col2.addRow("Report: top K / pair:", self.spin_report_k)
+        col2.addRow("Missing climate:", missing_box)
+        _res = system_resources()
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(0, max(1, int(_res["cpu"])))
+        self.spin_workers.setValue(0)
+        self.spin_workers.setSpecialValueText(f"Auto (up to {safe_worker_count(10 ** 6)})")
+        self.spin_workers.setMaximumWidth(150)
+        self.spin_workers.setToolTip(
+            "Parallel processes for the analysis. Auto uses the computer's logical CPUs minus one, limited by the free "
+            f"memory (this computer: {int(_res['cpu'])} logical CPUs, "
+            f"{_res['mem_avail_mb'] / 1024:.1f} of {_res['mem_total_mb'] / 1024:.1f} GB free). "
+            "Each chronology x dataset pair is one task; small analyses run in one process."
+        )
+        self.chk_reuse_pairs = QCheckBox("Re-use unchanged pairs")
+        self.chk_reuse_pairs.setChecked(True)
+        self.chk_reuse_pairs.setToolTip(
+            "Pairs (chronology x dataset) already computed in this session with the same settings and unchanged data "
+            "are not computed again: only the new datasets are screened, the table shows all selected pairs "
+            "without duplicates. Untick to compute everything again.")
+        col2.addRow("CPU processes:", _pair(self.spin_workers, self.chk_reuse_pairs))
+        p_layout.addLayout(col2, 3)
 
-        p_layout_right.addLayout(season_layout)
-        p_layout_right.addStretch(1)
+        # column 3: multi-year periods
+        period_group = QGroupBox("Multi-year periods")
+        period_group.setStyleSheet("QGroupBox { font-weight: 400; }")
+        pf = QFormLayout()
+        pf.setLabelAlignment(Qt.AlignRight)
+        pf.setVerticalSpacing(3)
+        self.chk_enable_periods = QCheckBox("Enable")
+        self.chk_enable_periods.setChecked(False)
+        self.chk_enable_periods.setToolTip(
+            "When enabled, correlations are also computed over multiple sub-periods using the settings below."
+        )
+        self.spin_period_min_span = _spin(2, 500, 50,
+                                          "Minimal period span (years). In Anchored/Grid modes this is the minimum allowed length; "
+                                          "in Sliding it is also the fixed window length.", 70)
+        self.spin_period_step = _spin(1, 100, 5,
+                                      "Step (years) for shifting period boundaries: Anchored trims edges by this step; "
+                                      "Sliding moves fixed-length windows by this step; Grid uses it as the start/end grid step.", 70)
+        self.spin_min_period_points = _spin(5, 5000, 10,
+                                            "Minimal number of non-missing observations required inside the period to compute correlation.", 70)
+        self.radio_period_anchored = QRadioButton("Anchored")
+        self.radio_period_sliding = QRadioButton("Sliding")
+        self.radio_period_grid = QRadioButton("Grid")
+        self.radio_period_anchored.setChecked(True)
+        self.radio_period_anchored.setToolTip(
+            "Anchored mode: trim from the earliest/latest side by the chosen step until the minimal span is reached "
+            "(e.g., 1910–Ymax, 1920–Ymax, and Ymin–1990, Ymin–1980, ...)."
+        )
+        self.radio_period_sliding.setToolTip(
+            "Sliding mode: use a fixed length equal to Minimal period span and slide the window by the step."
+        )
+        self.radio_period_grid.setToolTip(
+            "Exhaustive mode (experimental): start/end grid with the given step; only intervals of at least the minimal span are kept "
+            "(may be slow)."
+        )
+        self.period_mode_group = QButtonGroup(self)
+        for rb in (self.radio_period_anchored, self.radio_period_sliding, self.radio_period_grid):
+            self.period_mode_group.addButton(rb)
+        pf.addRow(self.chk_enable_periods)
+        pf.addRow("Min. span (years):", self.spin_period_min_span)
+        pf.addRow("Step (years):", self.spin_period_step)
+        pf.addRow("Min. points:", self.spin_min_period_points)
+        pf.addRow("Mode:", _pair(self.radio_period_anchored, self.radio_period_sliding, self.radio_period_grid))
+        period_group.setLayout(pf)
+        p_layout.addWidget(period_group, 2)
 
-        p_layout.addLayout(p_layout_left)
-        p_layout.addLayout(p_layout_mid)
-        p_layout.addLayout(p_layout_right)
         group_params.setLayout(p_layout)
-        scroll_layout.addWidget(group_params)
-        scroll_layout.addStretch(1)
+        params_lay.addWidget(group_params)
+        params_lay.addStretch(1)
 
-        analysis_scroll = QScrollArea()
-        analysis_scroll.setWidgetResizable(True)
-        analysis_scroll.setFrameShape(QScrollArea.NoFrame)
-        analysis_scroll.setWidget(scroll_host)
-        layout.addWidget(analysis_scroll, 1)
+        params_scroll = QScrollArea()
+        params_scroll.setWidgetResizable(True)
+        params_scroll.setFrameShape(QScrollArea.NoFrame)
+        params_scroll.setWidget(params_host)
+
+        self.analysis_splitter = QSplitter(Qt.Vertical)
+        self.analysis_splitter.setChildrenCollapsible(False)
+        self.analysis_splitter.addWidget(group_sets)
+        self.analysis_splitter.addWidget(params_scroll)
+        self.analysis_splitter.setStretchFactor(0, 3)
+        self.analysis_splitter.setStretchFactor(1, 2)
+        self.analysis_splitter.setSizes([600, 260])
+        layout.addWidget(self.analysis_splitter, 1)
         # Connect selection / checkbox changes to common-period handler
         self.list_chron_for_analysis.itemSelectionChanged.connect(
             self._update_year_range_from_selection
@@ -7293,26 +9294,8 @@ class MainWindow(QMainWindow):
         self.tab_analysis.setLayout(layout)
 
     def show_analysis_help(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Help - Analysis parameters")
-        dlg.resize(700, 380)
-        lay = QVBoxLayout()
-        text = QTextEdit()
-        text.setReadOnly(True)
-        text.setHtml(
-            "<h3>Analysis help</h3>"
-            "<p>Use Edit/Filter Columns during import to drop and rename columns correctly.</p>"
-            "<p>Exclude single-month windows to skip one-month windows like pMay (previous year) or Jan (current year) if desired.</p>"
-            "<p>Multi-year period analysis can scan anchored, sliding, or exhaustive start/end year combinations when enabled. "
-            "Anchored trims from the earliest/latest edge by the chosen step until reaching the minimal span; "
-            "sliding uses the minimal span as a fixed-length window shifted by the step; the exhaustive grid checks many combinations with the step as the grid stride and may be slow.</p>"
-        )
-        lay.addWidget(text)
-        ok = QPushButton("Close")
-        ok.clicked.connect(dlg.accept)
-        lay.addWidget(ok)
-        dlg.setLayout(lay)
-        dlg.exec()
+        """Open the Help dialog at the Analysis section."""
+        self.show_help(anchor="analysis")
 
     def _on_common_period_toggled(self, checked: bool) -> None:
         """
@@ -7642,7 +9625,7 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(QLabel("Show:"))
         self.combo_results_view = QComboBox()
         self.combo_results_view.addItems(["Main correlations", "Period correlations"])
-        self.combo_results_view.currentIndexChanged.connect(self.update_results_table)
+        self.combo_results_view.currentIndexChanged.connect(lambda *_a: self.apply_result_filters())
         view_layout.addWidget(self.combo_results_view)
         view_layout.addSpacing(12)
         view_layout.addWidget(QLabel("Export:"))
@@ -7659,17 +9642,61 @@ class MainWindow(QMainWindow):
         self.combo_results_export.setCurrentIndex(0)
         self.combo_results_export.currentIndexChanged.connect(self._on_results_export_changed)
         view_layout.addWidget(self.combo_results_export)
+        view_layout.addSpacing(12)
+        btn_spatial_r = QPushButton("Spatial correlation...")
+        btn_spatial_r.setToolTip("Summary of these results, suggested correlation maps and the map page")
+        btn_spatial_r.clicked.connect(self.open_field_panel)
+        view_layout.addWidget(btn_spatial_r)
+        btn_moving_r = QPushButton("Moving correlation...")
+        btn_moving_r.setToolTip("Temporal stability of the strongest climate signals (running correlations)")
+        btn_moving_r.clicked.connect(self.open_moving_panel)
+        view_layout.addWidget(btn_moving_r)
         view_layout.addStretch(1)
         layout.addLayout(view_layout)
+        layout.addWidget(self._build_results_filter_bar())
         self.table_results = QTableView()
-        layout.addWidget(self.table_results)
+        self.table_results.setAlternatingRowColors(True)
+        self.table_results.setToolTip(
+            "Click a row (or move with the arrow keys) to plot it. Ctrl+C copies cells, "
+            "Ctrl+Shift+C copies with headers, right-click for more."
+        )
         graph_group = QGroupBox("Plots for selected row / pair")
         g_layout = QVBoxLayout()
+        plot_ctl = QHBoxLayout()
+        plot_ctl.addWidget(QLabel("Plot:"))
+        self.combo_plot_mode = QComboBox()
+        self.combo_plot_mode.addItems(PLOT_MODES)
+        self.combo_plot_mode.setToolTip(
+            "Overview: monthly correlations, window heatmap, standardised series and running correlation"
+        )
+        plot_ctl.addWidget(self.combo_plot_mode)
+        plot_ctl.addSpacing(12)
+        plot_ctl.addWidget(QLabel("Running window:"))
+        self.spin_running_window = QSpinBox()
+        self.spin_running_window.setRange(11, 101)
+        self.spin_running_window.setSingleStep(2)
+        self.spin_running_window.setValue(31)
+        self.spin_running_window.setSuffix(" yr")
+        plot_ctl.addWidget(self.spin_running_window)
+        plot_ctl.addStretch(1)
+        g_layout.addLayout(plot_ctl)
         self.canvas = MplCanvas()
-        g_layout.addWidget(self.canvas)
+        self.plot_toolbar = NavigationToolbar2QT(self.canvas, graph_group)
+        if _uihelp is not None and hasattr(_uihelp, "mpl_wheel_zoom"):
+            _uihelp.mpl_wheel_zoom(self.canvas)  # mouse wheel zooms around the cursor
+        g_layout.addWidget(self.plot_toolbar)
+        g_layout.addWidget(self.canvas, 1)
         graph_group.setLayout(g_layout)
-        layout.addWidget(graph_group)
+        results_split = QSplitter(Qt.Vertical)
+        results_split.addWidget(self.table_results)
+        results_split.addWidget(graph_group)
+        results_split.setStretchFactor(0, 2)
+        results_split.setStretchFactor(1, 3)
+        results_split.setChildrenCollapsible(False)
+        layout.addWidget(results_split, 1)
         self.tab_results.setLayout(layout)
+        self.combo_plot_mode.currentIndexChanged.connect(lambda _i: self._replot_current_result())
+        self.spin_running_window.valueChanged.connect(lambda _v: self._replot_current_result())
         self.table_results.clicked.connect(self.update_plot_from_selection)
 
     # ---- Report tab ----
@@ -7683,6 +9710,7 @@ class MainWindow(QMainWindow):
         top_row.addStretch(1)
         layout.addLayout(top_row)
         self.table_report = QTableView()
+        self.table_report.setAlternatingRowColors(True)
         layout.addWidget(self.table_report)
         self.tab_report.setLayout(layout)
 
@@ -7782,6 +9810,70 @@ class MainWindow(QMainWindow):
     # -----------------------
     # helper
     # -----------------------
+    def _analysis_list_panel(self, title: QLabel, lw: QListWidget) -> QWidget:
+        """List with a title, live counter, filter box and All / None buttons."""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
+        head = QHBoxLayout()
+        f = title.font()
+        f.setBold(True)
+        title.setFont(f)
+        head.addWidget(title)
+        count = QLabel("")
+        count.setStyleSheet("color: #52514e;")
+        head.addWidget(count)
+        head.addStretch(1)
+        flt = QLineEdit()
+        flt.setPlaceholderText("Filter...")
+        flt.setClearButtonEnabled(True)
+        flt.setMaximumWidth(220)
+        head.addWidget(flt)
+        b_all = QPushButton("All")
+        b_none = QPushButton("None")
+        for b in (b_all, b_none):
+            b.setMaximumWidth(60)
+            head.addWidget(b)
+        v.addLayout(head)
+        v.addWidget(lw, 1)
+
+        def update_count() -> None:
+            try:
+                lw.count()
+            except RuntimeError:  # window closed
+                return
+            n = lw.count()
+            sel = len(lw.selectedItems())
+            shown = sum(1 for i in range(n) if not lw.item(i).isHidden())
+            count.setText(f"{sel} of {n} selected" + (f", {shown} shown" if shown != n else ""))
+
+        def apply_filter(text: str) -> None:
+            words = [t for t in text.lower().split() if t]
+            for i in range(lw.count()):
+                it = lw.item(i)
+                it.setHidden(bool(words) and not all(t in it.text().lower() for t in words))
+            update_count()
+
+        def select_visible(on: bool) -> None:
+            lw.blockSignals(True)
+            for i in range(lw.count()):
+                it = lw.item(i)
+                if not it.isHidden():
+                    it.setSelected(on)
+            lw.blockSignals(False)
+            lw.itemSelectionChanged.emit()
+
+        flt.textChanged.connect(apply_filter)
+        b_all.clicked.connect(lambda: select_visible(True))
+        b_none.clicked.connect(lambda: select_visible(False))
+        lw.itemSelectionChanged.connect(update_count)
+        lw.model().rowsInserted.connect(lambda *_a: (apply_filter(flt.text())))
+        lw.model().rowsRemoved.connect(lambda *_a: update_count())
+        lw.model().modelReset.connect(lambda *_a: update_count())
+        lw.setToolTip("Click to select or deselect; double-click to preview. Words in the filter must all match.")
+        return w
+
     def _wrap_with_label(self, text: str, widget: QWidget) -> QWidget:
         w = QWidget()
         l = QVBoxLayout()
@@ -8002,36 +10094,22 @@ class MainWindow(QMainWindow):
         if df is None or df.empty:
             return False
 
-        # Normalize column lookup (case-insensitive).
-        colmap = {str(c).strip().lower(): c for c in df.columns}
-        required = [
-            "country",
-            "code_wmo",
-            "name",
-            "year",
-            "jan",
-            "feb",
-            "mar",
-            "apr",
-            "may",
-            "jun",
-            "jul",
-            "aug",
-            "sep",
-            "oct",
-            "nov",
-            "dec",
-        ]
-        if not all(r in colmap for r in required):
+        detected = _detect_monthly_wide_columns(df)
+        if detected is None:
             return False
 
-        country_col = colmap["country"]
-        code_col = colmap["code_wmo"]
-        name_col = colmap["name"]
-        year_col = colmap["year"]
-        month_src = [colmap[m] for m in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]]
+        station_meta = detected.get("station_meta", {}) or {}
+        country_col = station_meta.get("country")
+        code_col = station_meta.get("code_wmo")
+        name_col = station_meta.get("name")
+        year_col = detected["year_col"]
+        month_src = detected["month_cols"]
 
-        df_sub = df[[country_col, code_col, name_col, year_col] + month_src].copy()
+        if not name_col and not code_col:
+            return False
+
+        meta_cols = [c for c in [country_col, code_col, name_col] if c]
+        df_sub = df[meta_cols + [year_col] + month_src].copy()
 
         # Treat -999 style sentinels as missing values.
         df_sub = _replace_sentinel_missing(df_sub, month_src)
@@ -8039,7 +10117,15 @@ class MainWindow(QMainWindow):
         imported = 0
         excluded: List[str] = []
 
-        for (country, code, st_name), g in df_sub.groupby([country_col, code_col, name_col], dropna=False):
+        group_cols = [c for c in [code_col, name_col, country_col] if c]
+        for key_vals, g in df_sub.groupby(group_cols, dropna=False):
+            if not isinstance(key_vals, tuple):
+                key_vals = (key_vals,)
+            key_map = {col: val for col, val in zip(group_cols, key_vals)}
+            country = key_map.get(country_col, "")
+            code = key_map.get(code_col, "")
+            st_name = key_map.get(name_col, "")
+
             g2 = g[[year_col] + month_src].copy()
             g2 = g2.rename(columns={year_col: "Year", **{src: dst for src, dst in zip(month_src, MONTH_NAMES)}})
 
@@ -8187,10 +10273,10 @@ class MainWindow(QMainWindow):
         try:
             # ==== Excel files ====
             if path.lower().endswith((".xls", ".xlsx")):
-                # read sheet names first
-                sheets = pd.read_excel(path, sheet_name=None)
-                if len(sheets) > 1:
-                    sheets_list = list(sheets.keys())
+                # Read only sheet names first
+                sheet_names = _get_excel_sheet_names(path)
+                if len(sheet_names) > 1:
+                    sheets_list = list(sheet_names)
                     sel, ok = self.choose_from_list_dialog(
                         "Select sheets to import",
                         "Choose sheets (Ctrl+click multi):",
@@ -8200,7 +10286,7 @@ class MainWindow(QMainWindow):
                         return False
                     chosen = sel
                 else:
-                    chosen = list(sheets.keys())
+                    chosen = list(sheet_names)
 
                 for sh in chosen:
                     while True:
@@ -8221,7 +10307,7 @@ class MainWindow(QMainWindow):
                         comment = mappings.get("comment", None)  # kept for parity
 
                         # Read sheet once with proper header setting
-                        df_sheet = pd.read_excel(
+                        df_sheet = _read_excel_robust(
                             path,
                             sheet_name=sh,
                             header=header_arg,
@@ -8365,6 +10451,14 @@ class MainWindow(QMainWindow):
                     reuse_mapping = bool(batch_ctx.get("reuse_mapping_by_ext")) if isinstance(batch_ctx, dict) else False
                     cache = batch_ctx.get("mapping_cache_by_ext", {}) if (isinstance(batch_ctx, dict) and reuse_mapping) else {}
                     mappings = cache.get(ext) if isinstance(cache, dict) else None
+                    if mappings is not None:
+                        # same layout, but every file has its own variable: detect it again for this file
+                        mappings = dict(mappings)
+                        bm = batch_metadata_for_file(path)
+                        guess = ((bm or {}).get("climate_param") or guess_climate_param_from_metadata(path)
+                                 or guess_climate_param_from_name(path, ""))
+                        if guess:
+                            mappings["climate_param"] = guess
                     if mappings is None:
                         dlg = FileImportDialog(
                             df=None,
@@ -8420,8 +10514,16 @@ class MainWindow(QMainWindow):
                                 f"col_{i+1}" for i in range(len(df.columns))
                             ]
 
+                    _n_before = len(self.datasets)
                     created_ok = self._create_datasets_from_mapping(df, name, path, mappings)
                     if created_ok:
+                        bm = batch_metadata_for_file(path)
+                        if bm and bm.get("meta"):
+                            for _ds in self.datasets[_n_before:]:
+                                m = dict(getattr(_ds, "meta", None) or {})
+                                for k, v in bm["meta"].items():
+                                    m.setdefault(k, v)
+                                setattr(_ds, "meta", m)
                         if is_batch:
                             _mark_batch_import("manual")
                         else:
@@ -8514,6 +10616,51 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.warning(self, "Month columns", f"Month column '{m}' not found after filtering/rename. Import skipped.")
                     return False
+
+            meta_candidates = [c for c in df_proc.columns if c not in ([yr] + month_cols)]
+            station_meta = _detect_station_metadata_columns(meta_candidates)
+            group_cols = [c for c in [station_meta.get("code_wmo"), station_meta.get("name"), station_meta.get("country")] if c]
+
+            if group_cols:
+                imported = 0
+                for key_vals, g in df_proc.groupby(group_cols, dropna=False):
+                    if not isinstance(key_vals, tuple):
+                        key_vals = (key_vals,)
+                    key_map = {col: val for col, val in zip(group_cols, key_vals)}
+                    station_name = key_map.get(station_meta.get("name"), "")
+                    station_code = key_map.get(station_meta.get("code_wmo"), "")
+                    station_country = key_map.get(station_meta.get("country"), "")
+
+                    g2 = g[[yr] + month_cols].copy()
+                    g2 = g2.rename(
+                        columns={yr: "Year", **{src: dst for src, dst in zip(month_cols, MONTH_NAMES)}}
+                    )
+                    g2 = _prepare_monthly_climate_df_for_analysis(
+                        g2,
+                        year_col="Year",
+                        month_cols=MONTH_NAMES,
+                        missing_policy="ignore",
+                    )
+                    if g2.empty:
+                        continue
+
+                    name_base = str(station_name).strip() if str(station_name).strip() else str(name)
+                    suffix_parts = [str(v).strip() for v in (station_code, station_country) if str(v).strip()]
+                    ds_name = name_base if not suffix_parts else f"{name_base} ({'_'.join(suffix_parts)})"
+
+                    ds = DataSet(name=ds_name, path=path, df=g2, kind="climate")
+                    ds.year_col = "Year"
+                    ds.month_columns = MONTH_NAMES[:]
+                    ds.climate_param = mappings.get("climate_param", "Other")
+                    self.datasets.append(ds)
+                    item = QListWidgetItem(f"{ds.name} (climate: {ds.climate_param})")
+                    item.setData(Qt.UserRole, ds)
+                    self.list_datasets.addItem(item)
+                    imported += 1
+
+                if imported > 0:
+                    return True
+
             ds = DataSet(name=name, path=path, df=df_proc[[yr] + month_cols], kind="climate")
             ds.year_col = yr
             ds.month_columns = month_cols
@@ -8776,6 +10923,14 @@ class MainWindow(QMainWindow):
     # -----------------------
     # Remove / refresh
     # -----------------------
+    def _remove_by_key(self) -> None:
+        n = len(self.list_datasets.selectedItems())
+        if n == 0:
+            return
+        if QMessageBox.question(self, "Remove datasets", f"Remove {n} selected dataset(s) from the session?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
+            self.remove_selected_dataset()
+
     def remove_selected_dataset(self):
         items = self.list_datasets.selectedItems()
         if not items:
@@ -8949,6 +11104,14 @@ class MainWindow(QMainWindow):
             pass
 
     def refresh_analysis_lists(self):
+        try:
+            self._push_chronology_locations()
+        except Exception:
+            pass
+        try:
+            self._autosave_session()
+        except Exception:
+            pass
         self.list_chron_for_analysis.clear()
         self.list_climate_for_analysis.clear()
         mode = self._get_analysis_target_mode() if hasattr(self, "_get_analysis_target_mode") else "climate"
@@ -9085,7 +11248,86 @@ class MainWindow(QMainWindow):
     # For brevity those methods are unchanged from previous version and kept below,
     # except where they were updated to honor the new aggregation choices and defaults.
     # -----------------------------------------------------------------
+    def _run_in_background(self, fn, label: str, ctl=None):
+        """Run fn() in a worker thread while the window stays responsive; None if cancelled.
+
+        With ``ctl`` (AnalysisControl) the dialog shows done/total and Cancel stops the worker processes.
+        """
+        import threading
+        import time as _time
+
+        box: Dict[str, Any] = {}
+
+        def work():
+            try:
+                box["result"] = fn()
+            except BaseException as exc:  # reported in the GUI thread
+                box["error"] = exc
+
+        th = threading.Thread(target=work, daemon=True)
+        dlg = QProgressDialog(label, "Cancel", 0, 0, self)
+        dlg.setWindowTitle("Analysis")
+        # not modal: the other tabs and windows stay usable while the analysis runs
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setMinimumDuration(300)
+        self._analysis_running = True
+        self._analysis_ctl = ctl
+        btn = getattr(self, "btn_run_analysis_top", None)
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("Analysis running...")
+        t0 = _time.time()
+        th.start()
+        while th.is_alive():
+            QApplication.processEvents()
+            if dlg.wasCanceled() or getattr(self, "_closing", False):
+                if ctl is not None:
+                    ctl.cancel.set()
+                dlg.close()
+                self._analysis_done_ui()
+                return None
+            el = int(_time.time() - t0)
+            if ctl is not None and ctl.total:
+                if dlg.maximum() != ctl.total:
+                    dlg.setRange(0, ctl.total)
+                dlg.setValue(min(ctl.done, ctl.total))
+                eta = ""
+                if ctl.done:
+                    rest = el / ctl.done * (ctl.total - ctl.done)
+                    eta = f", about {int(rest // 60)} min {int(rest % 60)} s left"
+                dlg.setLabelText(f"{label}\n{ctl.done} of {ctl.total} pair(s) done with {ctl.workers} parallel "
+                                 f"process(es), {el} s{eta}")
+            else:
+                dlg.setLabelText(f"{label}\n{el} s")
+            _time.sleep(0.05)
+        dlg.close()
+        self._analysis_done_ui()
+        self._last_run_seconds = _time.time() - t0
+        if "error" in box:
+            if type(box["error"]).__name__ == "_AnalysisCancelled":
+                return None
+            raise box["error"]
+        return box.get("result")
+
+    def _analysis_done_ui(self) -> None:
+        self._analysis_running = False
+        self._analysis_ctl = None
+        btn = getattr(self, "btn_run_analysis_top", None)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText("Run analysis")
+
+    def _clear_analysis_selection(self) -> None:
+        """Clear the selection in the chronology list and in the climate/target list."""
+        for lst in (getattr(self, "list_chron_for_analysis", None), getattr(self, "list_climate_for_analysis", None)):
+            if lst is not None:
+                lst.clearSelection()
+
     def run_analysis(self):
+        if getattr(self, "_analysis_running", False):
+            QMessageBox.information(self, "Analysis", "An analysis is already running - wait until it has finished "
+                                    "or cancel it in its progress window.")
+            return
         self.filtered_result_df = None
         self.period_result_df = None
         self.filtered_period_df = None
@@ -9248,6 +11490,7 @@ class MainWindow(QMainWindow):
         min_span = int(self.spin_period_min_span.value())
         step_years = int(self.spin_period_step.value())
         min_period_points = int(self.spin_min_period_points.value())
+        min_n = int(self.spin_min_n.value()) if hasattr(self, "spin_min_n") else 3
         if self.radio_period_anchored.isChecked():
             period_mode = "anchored"
         elif self.radio_period_sliding.isChecked():
@@ -9256,80 +11499,102 @@ class MainWindow(QMainWindow):
             period_mode = "grid"
         # --- END NEW ---
 
-        try:
-            if mode == "climate":
-                if resolution == "daily":
-                    df_res = compute_daily_timeseries_correlations(
-                        chron_sets=chron_sets,
-                        timeseries_sets=timeseries_sets,
-                        year_start=year_start,
-                        year_end=year_end,
-                        min_len=min_len,
-                        max_len=max_len,
-                        corr_method=corr_method,
-                        aggs=["sum"],
-                        alpha=0.05,
-                        exclude_single=exclude_single,
-                        base_agg_choice=ts_monthly_agg,
-                        agg_resolver=resolve_aggs,
-                    )
-                else:
-                    df_res = compute_correlations(
-                        chron_sets=chron_sets,
-                        climate_sets=climate_sets,
-                        year_start=year_start,
-                        year_end=year_end,
-                        min_len=min_len,
-                        max_len=max_len,
-                        corr_method=corr_method,
-                        missing_policy=missing_policy,
-                        local_window_k=missing_local_k,
-                        interpolate_max_gap=missing_interp_gap,
-                        aggs=["sum"],
-                        season_months=season_months,
-                        alpha=0.05,
-                        exclude_single=exclude_single,
-                        period_enable=period_enable,
-                        min_period_span=min_span,
-                        step_years=step_years,
-                        min_period_points=min_period_points,
-                        period_mode=period_mode,
-                        period_rows_out=period_rows,
-                        agg_resolver=resolve_aggs,
-                    )
-            else:
-                df_res = compute_chronology_correlations(
-                    chron_sets_a=chron_sets,
-                    chron_sets_b=chron_targets,
-                    year_start=year_start,
-                    year_end=year_end,
-                    corr_method=corr_method,
-                    alpha=0.05,
-                    period_enable=period_enable,
-                    min_period_span=min_span,
-                    step_years=step_years,
-                    min_period_points=min_period_points,
-                    period_mode=period_mode,
-                    period_rows_out=period_rows,
-                )
+        common = dict(year_start=year_start, year_end=year_end, corr_method=corr_method, alpha=0.05, min_n=min_n)
+        if mode == "climate" and resolution == "daily":
+            kind, right_list = "daily", timeseries_sets
+            kw = dict(common, min_len=min_len, max_len=max_len, aggs=["sum"], exclude_single=exclude_single,
+                      base_agg_choice=ts_monthly_agg, agg_resolver=_AggResolver(agg_text))
+        elif mode == "climate":
+            kind, right_list = "monthly", climate_sets
+            kw = dict(common, min_len=min_len, max_len=max_len, missing_policy=missing_policy,
+                      local_window_k=missing_local_k, interpolate_max_gap=missing_interp_gap, aggs=["sum"],
+                      season_months=season_months, exclude_single=exclude_single, period_enable=period_enable,
+                      min_period_span=min_span, step_years=step_years, min_period_points=min_period_points,
+                      period_mode=period_mode, agg_resolver=_AggResolver(agg_text))
+        else:
+            kind, right_list = "chronology", chron_targets
+            kw = dict(common, period_enable=period_enable, min_period_span=min_span, step_years=step_years,
+                      min_period_points=min_period_points, period_mode=period_mode)
+        ctl = AnalysisControl()
+        n_workers = int(self.spin_workers.value()) if hasattr(self, "spin_workers") else 0
 
+        # pairs computed before with the same settings and unchanged data are taken from the cache
+        reuse = not hasattr(self, "chk_reuse_pairs") or self.chk_reuse_pairs.isChecked()
+        cache = getattr(self, "_pair_cache", None)
+        if cache is None:
+            cache = self._pair_cache = {}
+        sig = settings_fingerprint(kind, kw)
+        fps = {id(d): dataset_fingerprint(d) for d in list(chron_sets) + list(right_list)}
+        all_pairs = [(c, r) for c in chron_sets for r in right_list]
+        cached_parts, todo = [], []
+        for c, r in all_pairs:
+            key = (sig, fps[id(c)], fps[id(r)])
+            if reuse and key in cache:
+                cached_parts.append(cache[key])
+            else:
+                todo.append((c, r))
+        reused = len(cached_parts)
+
+        def _compute(ctl=ctl):
+            per_pair: List[Any] = []
+            run_correlation_tasks(kind, chron_sets, right_list, kw, n_workers, ctl, pairs=todo, per_pair_out=per_pair)
+            new_parts = []
+            for c, r, d, p in per_pair:
+                cache[(sig, fps[id(c)], fps[id(r)])] = (d, p)
+                new_parts.append((d, p))
+            df_res, periods = merge_pair_results(cached_parts + new_parts)
+            period_rows.extend(periods)
+            return df_res
+
+        if mode == "climate":
+            n_right = len(timeseries_sets) if resolution == "daily" else len(climate_sets)
+        else:
+            n_right = len(chron_targets)
+        n_pairs = len(todo)
+        if n_pairs == 0 and reused:
+            self.statusBar().showMessage(f"All {reused} pair(s) were computed before with the same settings - "
+                                         "results taken from the previous analysis.", 15000)
+        if n_pairs > 300 and QMessageBox.question(
+            self,
+            "Large analysis",
+            f"{len(chron_sets)} chronologies x {n_right} datasets = {n_pairs} pairs will be screened. "
+            "This can take a long time. Continue?\n\n(Tip: select only the chronologies you need, "
+            "e.g. with 'Top 3 recommended' or 'STD only'.)",
+        ) != QMessageBox.Yes:
+            return
+        try:
+            label = f"Screening {n_pairs} new pair(s)" + (f" ({reused} unchanged pair(s) re-used)" if reused else "") + " ..."
+            df_res = self._run_in_background(_compute, label, ctl=ctl)
         except Exception as e:
             QMessageBox.critical(self, "Analysis error", str(e))
             return
+        if df_res is None:  # cancelled
+            return
 
         self.result_df = df_res
-        self.filtered_result_df = self._apply_top_filter(self.result_df)
-
-        # build period dataframe (no top-filter yet, only store)
+        self._results_unsaved = not df_res.empty
+        if ctl.note:
+            self.statusBar().showMessage("Analysis: " + ctl.note, 20000)
+        for attr in ("_field_panel", "_moving_panel"):
+            fp = getattr(self, attr, None)
+            if fp is not None:
+                try:
+                    fp.refresh_from_host()
+                except Exception:
+                    pass
+        # build period dataframe
         if period_rows:
             self.period_result_df = pd.DataFrame(period_rows)
         else:
             self.period_result_df = pd.DataFrame()
-        self.filtered_period_df = self._apply_top_filter(self.period_result_df)
+        self._sync_result_filters_from_analysis()
+        self.filtered_result_df = self._filter_results(self.result_df)
+        self.filtered_period_df = self._filter_results(self.period_result_df)
 
         self._create_report_from_results()
-        self.update_results_table()
+        self.apply_result_filters()
         self.tabs.setCurrentWidget(self.tab_results)
+        self._autosave_session(now=True)
         n_periods = 0 if self.period_result_df is None else len(self.period_result_df)
         if df_res.empty:
             QMessageBox.information(
@@ -9341,7 +11606,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Done",
-                f"Obtained {len(df_res)} correlation rows.\nMulti-year periods: {n_periods} rows.",
+                f"Obtained {len(df_res)} correlation rows.\nMulti-year periods: {n_periods} rows.\n\n"
+                f"Computed {n_pairs} new pair(s) in {getattr(self, '_last_run_seconds', 0):.0f} s with {ctl.workers} "
+                f"parallel process(es)" + (f"; {reused} pair(s) re-used from the previous analysis "
+                                          "(same settings, unchanged data)." if reused else ".")
+                + "\nThe results are kept for recovery until you close the program; save the project to keep them.",
             )
 
     def _get_results_view_df(self) -> Optional[pd.DataFrame]:
@@ -9356,9 +11625,205 @@ class MainWindow(QMainWindow):
         else:
             df_base = self.result_df
             df_filtered = getattr(self, "filtered_result_df", None)
-        if df_filtered is not None and not df_filtered.empty:
+        if df_filtered is not None and df_base is not None and not df_base.empty:
             return df_filtered
         return df_base
+
+    # ---- result filters (applied to the finished results, no new analysis) ----
+    def _build_results_filter_bar(self) -> QWidget:
+        flow = FlowLayout(spacing=6)
+
+        def lab(t: str) -> QLabel:
+            return QLabel(t)
+
+        self.rf_top = QSpinBox()
+        self.rf_top.setRange(0, 1000000)
+        self.rf_top.setSpecialValueText("all")
+        self.rf_top.setToolTip("Keep only the N strongest rows (|r|); 'all' = no limit")
+        self.rf_top_mode = QComboBox()
+        self.rf_top_mode.addItems(["overall", "per pair", "per chronology", "per climate dataset",
+                                   "per climate type"])
+        self.rf_top_mode.setMaximumWidth(170)
+        self.rf_top_mode.setToolTip("Top N of the whole table, or of every chronology x dataset pair, chronology, "
+                                    "climate dataset or climate type")
+        self.rf_absr = QDoubleSpinBox()
+        self.rf_absr.setRange(0.0, 1.0)
+        self.rf_absr.setSingleStep(0.05)
+        self.rf_absr.setDecimals(2)
+        self.rf_absr.setToolTip("Minimum |r|")
+        self.rf_sign = QComboBox()
+        self.rf_sign.addItems(["r +/-", "r > 0", "r < 0"])
+        self.rf_sig = QComboBox()
+        self.rf_sig.addItems(["any p", "p < 0.05", "p < 0.01", "p < 0.001"])
+        self.rf_minn = QSpinBox()
+        self.rf_minn.setRange(0, 1000)
+        self.rf_minn.setSpecialValueText("any")
+        self.rf_minn.setToolTip("Minimum number of years (n)")
+        self.rf_len0 = QSpinBox()
+        self.rf_len1 = QSpinBox()
+        for sp, v in ((self.rf_len0, 1), (self.rf_len1, 24)):
+            sp.setRange(1, 24)
+            sp.setValue(v)
+            sp.setToolTip("Window length in months (daily windows are not filtered)")
+        self.rf_type = QComboBox()
+        self.rf_type.addItem("all climate types")
+        self.rf_type.setToolTip("Only one climate variable type")
+        self.rf_text = QLineEdit()
+        self.rf_text.setPlaceholderText("Search (all words): e.g. CRU pJul RES")
+        self.rf_text.setClearButtonEnabled(True)
+        self.rf_text.setMinimumWidth(220)
+        self.rf_best = QCheckBox("best window per pair")
+        self.rf_best.setToolTip("Only the strongest window of every chronology x dataset pair")
+        b_reset = QPushButton("Reset")
+        b_reset.setToolTip("Show all rows")
+        b_reset.clicked.connect(self._reset_result_filters)
+        self.rf_info = QLabel("")
+        self.rf_info.setStyleSheet("color: #52514e;")
+        for w in (lab("Filter:"), lab("top"), self.rf_top, self.rf_top_mode, lab("|r| >="), self.rf_absr,
+                  self.rf_sign, self.rf_sig, lab("n >="), self.rf_minn, lab("window"), self.rf_len0, lab("-"),
+                  self.rf_len1, lab("months"), self.rf_type, self.rf_best, self.rf_text, b_reset, self.rf_info):
+            flow.addWidget(w)
+        self._rf_timer = QTimer(self)
+        self._rf_timer.setSingleShot(True)
+        self._rf_timer.setInterval(250)
+        self._rf_timer.timeout.connect(self.apply_result_filters)
+        for w in (self.rf_top, self.rf_absr, self.rf_minn, self.rf_len0, self.rf_len1):
+            w.valueChanged.connect(lambda *_a: self._rf_timer.start())
+        for w in (self.rf_top_mode, self.rf_sign, self.rf_sig, self.rf_type):
+            w.currentIndexChanged.connect(lambda *_a: self._rf_timer.start())
+        self.rf_text.textChanged.connect(lambda *_a: self._rf_timer.start())
+        self.rf_best.toggled.connect(lambda *_a: self._rf_timer.start())
+        bar = FlowBar(flow)
+        bar.setToolTip("Filters work on the finished results immediately - the analysis is not run again.")
+        return bar
+
+    def _reset_result_filters(self) -> None:
+        widgets = (self.rf_top, self.rf_absr, self.rf_minn, self.rf_len0, self.rf_len1, self.rf_top_mode,
+                   self.rf_sign, self.rf_sig, self.rf_type, self.rf_text, self.rf_best)
+        for w in widgets:
+            w.blockSignals(True)
+        self.rf_top.setValue(0)
+        self.rf_absr.setValue(0.0)
+        self.rf_minn.setValue(0)
+        self.rf_len0.setValue(1)
+        self.rf_len1.setValue(24)
+        self.rf_top_mode.setCurrentIndex(0)
+        self.rf_sign.setCurrentIndex(0)
+        self.rf_sig.setCurrentIndex(0)
+        self.rf_type.setCurrentIndex(0)
+        self.rf_text.clear()
+        self.rf_best.setChecked(False)
+        for w in widgets:
+            w.blockSignals(False)
+        self.apply_result_filters()
+
+    def _sync_result_filters_from_analysis(self) -> None:
+        """After an analysis: top N from the Analysis tab, the climate types of the results."""
+        if not hasattr(self, "rf_top"):
+            return
+        self.rf_top.blockSignals(True)
+        self.rf_top_mode.blockSignals(True)
+        self.rf_top.setValue(int(self.spin_top_n.value()) if hasattr(self, "spin_top_n") else 0)
+        if hasattr(self, "combo_top_mode"):
+            self.rf_top_mode.setCurrentIndex(0 if self.combo_top_mode.currentText().startswith("Overall") else 1)
+        self.rf_top.blockSignals(False)
+        self.rf_top_mode.blockSignals(False)
+        self._refresh_result_type_list()
+
+    def _climate_type_of(self) -> Dict[str, str]:
+        return {d.name: (getattr(d, "climate_param", "") or "Other") for d in self.datasets}
+
+    def _refresh_result_type_list(self) -> None:
+        if not hasattr(self, "rf_type"):
+            return
+        df = self.result_df
+        types = []
+        if df is not None and not df.empty and "Climate" in df.columns:
+            m = self._climate_type_of()
+            types = sorted({m.get(c, "Other") for c in df["Climate"].unique()})
+        cur = self.rf_type.currentText()
+        self.rf_type.blockSignals(True)
+        self.rf_type.clear()
+        self.rf_type.addItem("all climate types")
+        self.rf_type.addItems(types)
+        i = self.rf_type.findText(cur)
+        self.rf_type.setCurrentIndex(i if i >= 0 else 0)
+        self.rf_type.blockSignals(False)
+
+    def _filter_results(self, df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        if df is None or df.empty or not hasattr(self, "rf_top") or "R" not in df.columns:
+            return df
+        d = df
+        r = pd.to_numeric(d["R"], errors="coerce")
+        keep = r.notna()
+        if self.rf_absr.value() > 0:
+            keep &= r.abs() >= self.rf_absr.value()
+        if self.rf_sign.currentIndex() == 1:
+            keep &= r > 0
+        elif self.rf_sign.currentIndex() == 2:
+            keep &= r < 0
+        a = {1: 0.05, 2: 0.01, 3: 0.001}.get(self.rf_sig.currentIndex())
+        if a and "p" in d.columns:
+            keep &= pd.to_numeric(d["p"], errors="coerce") < a
+        if self.rf_minn.value() > 0 and "N" in d.columns:
+            keep &= pd.to_numeric(d["N"], errors="coerce") >= self.rf_minn.value()
+        if "Window" in d.columns and (self.rf_len0.value() > 1 or self.rf_len1.value() < 24):
+            def wlen(w) -> float:
+                parts = str(w).split("_")
+                si = _window_label_to_idx(parts[0])
+                ei = _window_label_to_idx(parts[-1])
+                return float(ei - si + 1) if si is not None and ei is not None else float("nan")
+
+            ln = d["Window"].map(wlen)
+            keep &= ln.isna() | ((ln >= self.rf_len0.value()) & (ln <= self.rf_len1.value()))
+        if self.rf_type.currentIndex() > 0 and "Climate" in d.columns:
+            m = self._climate_type_of()
+            keep &= d["Climate"].map(lambda c: m.get(c, "Other")) == self.rf_type.currentText()
+        words = [w for w in self.rf_text.text().lower().split() if w]
+        if words:
+            cols = [c for c in ("Chronology", "Chron_Column", "Climate", "Target_Column", "Window", "Agg")
+                    if c in d.columns]
+            hay = d[cols].astype(str).agg(" ".join, axis=1).str.lower()
+            for w in words:
+                keep &= hay.str.contains(w, regex=False)
+        d = d[keep].copy()
+        d["_absr"] = pd.to_numeric(d["R"], errors="coerce").abs()
+        d = d.sort_values("_absr", ascending=False, kind="mergesort")
+        pair_cols = [c for c in ("Chronology", "Chron_Column", "Climate", "Target_Column") if c in d.columns]
+        if self.rf_best.isChecked() and pair_cols:
+            d = d.groupby(pair_cols, sort=False, dropna=False).head(1)
+        n = self.rf_top.value()
+        if n > 0:
+            mode = self.rf_top_mode.currentIndex()
+            if mode == 0:
+                d = d.head(n)
+            else:
+                if mode == 1:
+                    gcols = pair_cols
+                elif mode == 2:
+                    gcols = [c for c in ("Chronology", "Chron_Column") if c in d.columns]
+                elif mode == 3:
+                    gcols = [c for c in ("Climate", "Target_Column") if c in d.columns]
+                else:
+                    m = self._climate_type_of()
+                    d["_type"] = d["Climate"].map(lambda c: m.get(c, "Other")) if "Climate" in d.columns else ""
+                    gcols = ["_type"]
+                if gcols:
+                    d = d.groupby(gcols, sort=False, dropna=False).head(n)
+        return d.drop(columns=[c for c in ("_absr", "_type") if c in d.columns]).reset_index(drop=True)
+
+    def apply_result_filters(self) -> None:
+        """Filter the finished results (main and period tables) and show them."""
+        self.filtered_result_df = self._filter_results(self.result_df)
+        self.filtered_period_df = self._filter_results(self.period_result_df)
+        self.update_results_table()
+        df = self._get_results_view_df()
+        view_text = self.combo_results_view.currentText() if hasattr(self, "combo_results_view") else ""
+        base = self.period_result_df if view_text == "Period correlations" else self.result_df
+        if hasattr(self, "rf_info"):
+            nb = 0 if base is None else len(base)
+            nd = 0 if df is None else len(df)
+            self.rf_info.setText(f"showing {nd:,} of {nb:,} rows" if nb else "")
 
     def _apply_top_filter(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
@@ -9414,6 +11879,12 @@ class MainWindow(QMainWindow):
         model = PandasModel(df_to_show)
         self.table_results.setModel(model)
         self.table_results.resizeColumnsToContents()
+        try:
+            self.table_results.selectionModel().currentRowChanged.connect(
+                lambda cur, _prev: self.update_plot_from_selection(cur) if cur.isValid() else None
+            )
+        except Exception:
+            pass
 
     def update_plot_from_selection(self, index: QModelIndex):
         df_visible = self._get_results_view_df()
@@ -9459,6 +11930,15 @@ class MainWindow(QMainWindow):
         if "Target_Column" in df_visible.columns and "Target_Column" in rec.index:
             mask_vis = mask_vis & (df_visible["Target_Column"] == rec["Target_Column"])
         df_pair_visible = df_visible[mask_vis].copy()
+        if _dplots is not None:
+            chron_ds_v2 = next((d for d in self.datasets if d.name == rec["Chronology"]), None)
+            clim_ds_v2 = next((d for d in self.datasets if d.name == rec["Climate"]), None)
+            if chron_ds_v2 is not None and clim_ds_v2 is not None:
+                try:
+                    self._plot_selected_result_v2(rec, view_text, df_pair_all, df_pair_visible, chron_ds_v2, clim_ds_v2)
+                    return
+                except Exception as exc:
+                    print("Plot error (falling back to the classic plot):", exc)
         df_for_bars = df_pair_visible if (df_pair_visible is not None and not df_pair_visible.empty) else df_pair_all
         top_n_display = int(self.spin_top_n.value()) if hasattr(self, "spin_top_n") else 0
         if top_n_display > 0:
@@ -9650,6 +12130,237 @@ class MainWindow(QMainWindow):
             print("Heatmap error:", e)
         self.canvas.draw()
 
+    def _replot_current_result(self) -> None:
+        try:
+            idx = self.table_results.currentIndex()
+        except Exception:
+            return
+        if idx is not None and idx.isValid():
+            self.update_plot_from_selection(idx)
+
+    @staticmethod
+    def _dataset_series(ds: Any, column: str) -> pd.Series:
+        """Year-indexed numeric series of one dataset column."""
+        df = ds.df[[ds.year_col, column]].copy()
+        years = pd.to_numeric(df[ds.year_col], errors="coerce")
+        vals = pd.to_numeric(df[column], errors="coerce")
+        s = pd.Series(vals.to_numpy(dtype=float), index=years)
+        s = s[~pd.isna(s.index)]
+        s.index = s.index.astype(int)
+        return s[~s.index.duplicated(keep="first")].sort_index()
+
+    def _plot_selected_result_v2(
+        self,
+        rec: pd.Series,
+        view_text: str,
+        df_pair_all: pd.DataFrame,
+        df_pair_visible: Optional[pd.DataFrame],
+        chron_ds: "DataSet",
+        clim_ds: "DataSet",
+    ) -> None:
+        """Result plots: monthly response, window heatmap, standardised series, running r, scatter."""
+        DP = _dplots
+        fig = self.canvas.fig
+        fig.clf()
+        mode = self.combo_plot_mode.currentText() if hasattr(self, "combo_plot_mode") else "Overview"
+        window = int(self.spin_running_window.value()) if hasattr(self, "spin_running_window") else 31
+        corr_method = self.combo_corr.currentText() if hasattr(self, "combo_corr") else "pearson"
+        chron_col = str(rec["Chron_Column"])
+        pair_title = f"{rec['Chronology']} ({chron_col}) vs {rec['Climate']}"
+        period = None
+        if view_text == "Period correlations" and "PeriodStart" in rec.index and "PeriodEnd" in rec.index:
+            try:
+                period = (int(rec["PeriodStart"]), int(rec["PeriodEnd"]))
+            except Exception:
+                period = None
+        if period:
+            pair_title += f"  [{period[0]}-{period[1]}]"
+
+        a_full = self._dataset_series(chron_ds, chron_col)
+
+        top_src = df_pair_visible if (df_pair_visible is not None and not df_pair_visible.empty) else df_pair_all
+        n_top = int(self.spin_top_n.value()) if hasattr(self, "spin_top_n") else 0
+        n_top = n_top if n_top > 0 else 25
+        top = top_src.sort_values(by="R", key=lambda s: s.abs(), ascending=False).head(min(n_top, 40))
+        top = top.iloc[::-1]
+        has_window = "Window" in top.columns and "Agg" in top.columns
+        top_labels = (
+            (top["Window"].astype(str) + "_" + top["Agg"].astype(str)).tolist()
+            if has_window
+            else [str(i) for i in range(len(top))]
+        )
+        sel_label = f"{rec.get('Window', '')}_{rec.get('Agg', '')}" if has_window else None
+        top_n_vals = top["N"].tolist() if "N" in top.columns else None
+
+        def draw_top(ax) -> None:
+            DP.corr_bars(ax, top_labels, top["R"].tolist(), n=top_n_vals, highlight=sel_label,
+                         title=f"Strongest windows ({corr_method})")
+
+        def finish(single_title: str = "") -> None:
+            fig.suptitle(pair_title, fontsize=10, y=0.995)
+            self.canvas.draw()
+
+        # ---------- chronology vs non-monthly target (series / time series) ----------
+        if getattr(clim_ds, "kind", "") != "climate":
+            col_b = rec["Target_Column"] if ("Target_Column" in rec.index and pd.notna(rec["Target_Column"])) else None
+            if col_b is None:
+                col_b = clim_ds.value_columns[0] if getattr(clim_ds, "value_columns", None) else None
+            if col_b is None:
+                DP.message(fig.add_subplot(111), "No target column to plot")
+                return finish()
+            b_full = self._dataset_series(clim_ds, str(col_b))
+            both = pd.concat([a_full.rename("a"), b_full.rename("b")], axis=1, join="inner").dropna()
+            if period:
+                both = both.loc[(both.index >= period[0]) & (both.index <= period[1])]
+            if len(both) < 4:
+                DP.message(fig.add_subplot(111), "The two series do not overlap")
+                return finish()
+            la, lb = f"{rec['Chronology']}::{chron_col}", f"{rec['Climate']}::{col_b}"
+            if mode in ("Overview", "Monthly correlations", "Window heatmap"):
+                gs = fig.add_gridspec(2, 2, hspace=0.6, wspace=0.3, left=0.1, right=0.97, top=0.9, bottom=0.08)
+                if has_window:
+                    draw_top(fig.add_subplot(gs[0, 0]))
+                else:
+                    DP.scatter_fit(fig.add_subplot(gs[0, 0]), both["a"].values, both["b"].values, la, lb)
+                DP.scatter_fit(fig.add_subplot(gs[0, 1]), both["a"].values, both["b"].values, la, lb)
+                DP.zscore_overlay(fig.add_subplot(gs[1, 0]), both.index.values, both["a"].values, both["b"].values,
+                                  la, lb, smooth=11)
+                DP.running_corr_plot(fig.add_subplot(gs[1, 1]), both["a"], both["b"], window=window)
+            elif mode == "Top windows" and has_window:
+                draw_top(fig.add_subplot(111))
+            elif mode == "Running correlation":
+                DP.running_corr_plot(fig.add_subplot(111), both["a"], both["b"], window=window)
+            elif mode == "Scatter":
+                DP.scatter_fit(fig.add_subplot(111), both["a"].values, both["b"].values, la, lb)
+            else:
+                DP.zscore_overlay(fig.add_subplot(111), both.index.values, both["a"].values, both["b"].values,
+                                  la, lb, smooth=11)
+            return finish()
+
+        # ---------- chronology vs monthly climate ----------
+        min_len = int(self.spin_min_len.value())
+        max_len = int(self.spin_max_len.value())
+        agg_text = rec["Agg"] if ("Agg" in rec and pd.notna(rec["Agg"]) and rec["Agg"] != "") else self.combo_agg.currentText()
+        if agg_text in ("sum", "mean"):
+            agg_sel = agg_text
+        else:
+            agg_sel = get_default_agg_for_param(getattr(clim_ds, "climate_param", "Other"))
+        windows_df = generate_climate_windows(
+            clim_ds.df,
+            year_col=clim_ds.year_col,
+            month_cols_y=clim_ds.month_columns,
+            min_len=1,
+            max_len=max(1, max_len),
+            aggs=[agg_sel],
+        )
+        windows_df[clim_ds.year_col] = pd.to_numeric(windows_df[clim_ds.year_col], errors="coerce")
+        windows_df = windows_df.dropna(subset=[clim_ds.year_col])
+        windows_df.index = windows_df[clim_ds.year_col].astype(int)
+        merged = pd.concat([a_full.rename("__chron__"), windows_df.drop(columns=[clim_ds.year_col])], axis=1, join="inner")
+        if period:
+            merged = merged.loc[(merged.index >= period[0]) & (merged.index <= period[1])]
+        x_all = merged["__chron__"]
+
+        def r_of(col: str) -> tuple:
+            if col not in merged.columns:
+                return float("nan"), 0
+            pair = pd.concat([x_all, merged[col]], axis=1).dropna()
+            if len(pair) < 4:
+                return float("nan"), len(pair)
+            try:
+                return float(pair.iloc[:, 0].corr(pair.iloc[:, 1], method=corr_method)), len(pair)
+            except Exception:
+                return float(pair.iloc[:, 0].corr(pair.iloc[:, 1])), len(pair)
+
+        all_labels = [f"p{m}" for m in MONTH_NAMES] + MONTH_NAMES
+
+        def wname(start: int, end: int) -> str:
+            return all_labels[start] if start == end else f"{all_labels[start]}_{all_labels[end]}"
+
+        lengths = list(range(max(1, min_len), max(1, max_len) + 1))
+        grid = np.full((len(lengths), 24), np.nan)
+        n_cells = []
+        for i_len, L in enumerate(lengths):
+            for S in range(0, 24 - L + 1):
+                rr, nn = r_of(f"{wname(S, S + L - 1)}_{agg_sel}")
+                grid[i_len, S] = rr
+                if nn:
+                    n_cells.append(nn)
+        monthly = [r_of(f"{all_labels[k]}_{agg_sel}") for k in range(24)]
+        month_r = [m[0] for m in monthly]
+        month_n = int(np.median([m[1] for m in monthly if m[1]])) if any(m[1] for m in monthly) else 0
+        n_grid = int(np.median(n_cells)) if n_cells else 0
+
+        def cell_of(window_name: str):
+            parts = str(window_name).split("_")
+            try:
+                s0 = all_labels.index(parts[0])
+                e0 = all_labels.index(parts[-1]) if len(parts) > 1 else s0
+            except ValueError:
+                return None
+            L0 = e0 - s0 + 1
+            return (lengths.index(L0), s0) if L0 in lengths else None
+
+        best_cell = cell_of(rec["Window"]) if "Window" in rec.index else None
+        marked = []
+        if has_window:
+            for _, row in top.iterrows():
+                if str(row.get("Agg", "")) == agg_sel:
+                    c = cell_of(row["Window"])
+                    if c is not None and c != best_cell:
+                        marked.append(c)
+
+        sel_col = f"{rec['Window']}_{agg_sel}" if "Window" in rec.index else None
+        b_sel = merged[sel_col] if (sel_col and sel_col in merged.columns) else None
+        sel_name = f"{rec['Climate']} {rec.get('Window', '')} ({agg_sel})"
+        both = pd.concat([x_all.rename("a"), b_sel.rename("b")], axis=1).dropna() if b_sel is not None else None
+
+        def draw_monthly(ax) -> None:
+            DP.monthly_bars(ax, all_labels, month_r, n=month_n, divider_after=12,
+                            title=f"Single-month correlations ({agg_sel}, {corr_method})")
+
+        def draw_heat(ax, cax=None) -> None:
+            DP.window_heatmap(ax, grid, lengths, all_labels, n=n_grid, best=best_cell, marked=marked, cax=cax,
+                              title=f"Climate windows ({agg_sel}); star = selected, dots = top windows")
+
+        def need_both(ax) -> bool:
+            if both is None or len(both) < 4:
+                DP.message(ax, "Selected window has no overlapping years")
+                return False
+            return True
+
+        if mode == "Overview":
+            gs = fig.add_gridspec(2, 2, hspace=0.62, wspace=0.28, left=0.07, right=0.95, top=0.9, bottom=0.12)
+            draw_monthly(fig.add_subplot(gs[0, 0]))
+            draw_heat(fig.add_subplot(gs[0, 1]))
+            ax3 = fig.add_subplot(gs[1, 0])
+            if need_both(ax3):
+                DP.zscore_overlay(ax3, both.index.values, both["a"].values, both["b"].values,
+                                  chron_col, sel_name, smooth=11)
+            ax4 = fig.add_subplot(gs[1, 1])
+            if need_both(ax4):
+                DP.running_corr_plot(ax4, both["a"], both["b"], window=window)
+        elif mode == "Monthly correlations":
+            draw_monthly(fig.add_subplot(111))
+        elif mode == "Window heatmap":
+            draw_heat(fig.add_subplot(111))
+        elif mode == "Top windows":
+            draw_top(fig.add_subplot(111))
+        elif mode == "Running correlation":
+            ax = fig.add_subplot(111)
+            if need_both(ax):
+                DP.running_corr_plot(ax, both["a"], both["b"], window=window)
+        elif mode == "Scatter":
+            ax = fig.add_subplot(111)
+            if need_both(ax):
+                DP.scatter_fit(ax, both["a"].values, both["b"].values, chron_col, sel_name)
+        else:
+            ax = fig.add_subplot(111)
+            if need_both(ax):
+                DP.zscore_overlay(ax, both.index.values, both["a"].values, both["b"].values, chron_col, sel_name,
+                                  smooth=11)
+        finish()
+
     # -----------------------
     # Export computations & report
     # -----------------------
@@ -9840,7 +12551,7 @@ class MainWindow(QMainWindow):
                         path = path + ".csv"
                     windows_df.to_csv(path, index=False)
 
-                QMessageBox.information(self, "Saved", f"Windows saved to {path}")
+                self.notify_saved("Saved", "Windows saved.", path)
             except Exception as e:
                 QMessageBox.critical(self, "Export error", str(e))
 
@@ -9897,7 +12608,7 @@ class MainWindow(QMainWindow):
                 if not path.lower().endswith(".csv"):
                     path = path + ".csv"
                 merged.to_csv(path, index=False)
-            QMessageBox.information(self, "Saved", f"Merged data saved to {path}")
+            self.notify_saved("Saved", "Merged data saved.", path)
         except Exception as e:
             QMessageBox.critical(
                 self,
@@ -10161,6 +12872,8 @@ class MainWindow(QMainWindow):
                 "Export error",
                 f"Failed to export results:\n{exc}",
             )
+            return
+        self.notify_saved("Export", "The results were exported.", path)
 
     
     def _compute_window_sort_key(label: Any) -> Tuple[int, int]:
@@ -10204,7 +12917,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.canvas.fig.savefig(path, dpi=300)
-            QMessageBox.information(self, "Saved", f"Plot saved to {path}")
+            self.notify_saved("Saved", "Plot saved.", path)
         except Exception as e:
             QMessageBox.critical(self, "Save error", str(e))
 
@@ -10241,7 +12954,7 @@ class MainWindow(QMainWindow):
                 if not path.lower().endswith(".csv"):
                     path = path + ".csv"
                 df_export.to_csv(path, index=False)
-            QMessageBox.information(self, "Saved", f"Report saved to {path}")
+            self.notify_saved("Saved", "Report saved.", path)
         except Exception as e:
             QMessageBox.critical(self, "Save error", str(e))
 
@@ -10266,6 +12979,20 @@ class MainWindow(QMainWindow):
             "datasets": [],
             "analysis_settings_path": self.settings_path,
         }
+        for key, attr in (("moving_screening", "moving_screen_df"), ("field_screening", "field_screen_df")):
+            sdf = getattr(self, attr, None)
+            if isinstance(sdf, pd.DataFrame) and not sdf.empty:
+                try:
+                    proj[key] = json.loads(sdf.to_json(orient="split"))
+                except Exception as exc:
+                    print(f"{key} not stored in the project:", exc)
+        if self.result_df is not None and not self.result_df.empty:
+            try:
+                proj["results"] = json.loads(self.result_df.to_json(orient="split", date_format="iso"))
+                if self.period_result_df is not None and not self.period_result_df.empty:
+                    proj["period_results"] = json.loads(self.period_result_df.to_json(orient="split"))
+            except Exception as exc:
+                print("Results not stored in the project:", exc)
         for ds in self.datasets:
             proj["datasets"].append(
                 {
@@ -10286,12 +13013,14 @@ class MainWindow(QMainWindow):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(proj, f, indent=2)
             self.current_project_path = path
+            self._results_unsaved = False
             try:
                 self.last_dir_project = os.path.dirname(path) or self.last_dir_project
                 self.save_settings()
             except Exception:
                 pass
-            QMessageBox.information(self, "Saved", f"Project saved to {path}")
+            self.notify_saved("Saved", "Project saved" + (" with the analysis results." if "results" in proj
+                                                          else "."), path)
         except Exception as e:
             QMessageBox.critical(self, "Save project error", str(e))
 
@@ -10503,6 +13232,9 @@ class MainWindow(QMainWindow):
 
                 ds.climate_param = d.get("climate_param", "Other")
                 ds.columns_config = d.get("columns_config", None)
+                for _attr in ("source_freq", "meta", "monthly_agg", "derived_from_kind"):
+                    if _attr in d:
+                        setattr(ds, _attr, d.get(_attr))
                 self.datasets.append(ds)
                 # Add to the main list on the Data tab (analysis lists are rebuilt by refresh_analysis_lists()).
                 try:
@@ -10515,6 +13247,20 @@ class MainWindow(QMainWindow):
 
             self.refresh_analysis_lists()
             self.load_settings()
+            for key, attr in (("moving_screening", "moving_screen_df"), ("field_screening", "field_screen_df")):
+                if not merge_mode and isinstance(proj.get(key), dict):
+                    try:
+                        setattr(self, attr, pd.DataFrame(**proj[key]))
+                    except Exception:
+                        pass
+            if not merge_mode and isinstance(proj.get("results"), dict):
+                try:
+                    res = pd.DataFrame(**proj["results"])
+                    per = pd.DataFrame(**proj["period_results"]) if isinstance(proj.get("period_results"), dict) else None
+                    self._set_results(res, per)
+                    self._results_unsaved = False
+                except Exception as exc:
+                    print("Saved results could not be restored:", exc)
 
             QMessageBox.information(
                 self,
@@ -10537,6 +13283,8 @@ class MainWindow(QMainWindow):
                 self.last_dir_open = str(s.get("last_dir_open", self.last_dir_open))
                 self.last_dir_project = str(s.get("last_dir_project", self.last_dir_project))
                 self.last_dir_export = str(s.get("last_dir_export", self.last_dir_export))
+                if isinstance(s.get("online_data"), dict):
+                    self.online_settings = dict(s.get("online_data"))
 
                 geo_b64 = s.get("window_geometry_b64")
                 if isinstance(geo_b64, str) and geo_b64.strip():
@@ -10580,6 +13328,8 @@ class MainWindow(QMainWindow):
                     self.spin_report_k.setValue(int(s.get("spin_report_k", 10)))
                 if "chk_exclude_single" in s:
                     self.chk_exclude_single.setChecked(bool(s.get("chk_exclude_single", False)))
+                if "spin_min_n" in s and hasattr(self, "spin_min_n"):
+                    self.spin_min_n.setValue(int(s.get("spin_min_n", 15)))
                 if "spin_year_start" in s and "spin_year_end" in s:
                     try:
                         self.spin_year_start.setValue(int(s.get("spin_year_start", self.spin_year_start.value())))
@@ -10639,6 +13389,7 @@ class MainWindow(QMainWindow):
             "combo_top_mode": self.combo_top_mode.currentText(),
             "spin_report_k": int(self.spin_report_k.value()),
             "chk_exclude_single": bool(self.chk_exclude_single.isChecked()),
+            "spin_min_n": int(self.spin_min_n.value()),
             "spin_year_start": int(self.spin_year_start.value()),
             "spin_year_end": int(self.spin_year_end.value()),
             "combo_season": self.combo_season.currentText(),
@@ -10652,6 +13403,11 @@ class MainWindow(QMainWindow):
             if self.radio_period_grid.isChecked()
             else ("sliding" if self.radio_period_sliding.isChecked() else "anchored"),
             "ui_scale": float(self.spin_ui_scale.value()) if hasattr(self, "spin_ui_scale") else 1.0,
+            "online_data": (
+                self._online_dialog.get_settings()
+                if getattr(self, "_online_dialog", None) is not None
+                else getattr(self, "online_settings", {})
+            ),
         }
         try:
             with open(self.settings_path, "w", encoding="utf-8") as f:
@@ -10660,10 +13416,40 @@ class MainWindow(QMainWindow):
             print("Failed to save settings:", e)
 
     def closeEvent(self, event):
+        if getattr(self, "_analysis_running", False):
+            if QMessageBox.question(self, "Analysis running", "An analysis is still running. Stop it and close?") \
+                    != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._closing = True
+            ctl = getattr(self, "_analysis_ctl", None)
+            if ctl is not None:
+                ctl.cancel.set()
+        if getattr(self, "_results_unsaved", False) and self.result_df is not None and not self.result_df.empty:
+            ans = QMessageBox.question(
+                self, "Unsaved results",
+                f"The analysis results ({len(self.result_df):,} rows) have not been saved or exported.\n\n"
+                "Save the project with the results before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)
+            if ans == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if ans == QMessageBox.Save:
+                self.save_project_as()
+                if getattr(self, "_results_unsaved", False):  # save dialog cancelled
+                    event.ignore()
+                    return
+        self._discard_recovery()
         try:
             self.save_settings()
         except Exception as e:
             print("Error saving settings:", e)
+        # Online data: keep the download list / cached values for the next start?
+        if _online_qt is not None and getattr(_online_qt, "SQ", None) is not None:
+            try:
+                _online_qt.SQ.ask_keep_cache_qt(self)
+            except Exception:
+                pass
         super().closeEvent(event)
 
 
@@ -10689,15 +13475,26 @@ def main():
             except Exception:
                 pass
 
+    _set_windows_app_user_model_id("Bakhtiyorov.RingClim")
     app = QApplication(argv)
+    _apply_modern_style(app)
+    _apply_app_icon(app)
+    if _uihelp is not None:
+        _uihelp.install_qt(app)
     window = MainWindow(prefill_manifest=prefill_manifest)
 
     window.show()
+    if _uihelp is not None:
+        # main window already shows the signature in the status bar: tooltips only
+        QTimer.singleShot(300, lambda: _uihelp.decorate_qt(window, footer=False))
     QTimer.singleShot(0, window._request_user_attention)
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
+    import multiprocessing as _mp
+
+    _mp.freeze_support()  # parallel analysis workers in the packaged program
     main()
 
 # Developed by Dr. Zulfiyor Bakhtiyorov

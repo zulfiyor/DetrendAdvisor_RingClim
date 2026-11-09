@@ -1,145 +1,50 @@
-# DetrendAdvisor + RingClim Suite
+# DeClim — Detrend Advisor + RingClim
 
-Integrated desktop suite for dendrochronological detrending advice, chronology export, and tree-ring climate correlation analysis.
+**DeClim** is a pair of linked desktop programs for dendroclimatology, from raw ring widths to the climate response:
 
-## Overview
-DetrendAdvisor_RingClim is a connected research software suite for dendrochronology and climate analysis. The repository contains an upstream detrending/advisory desktop application (`detrend_advisor.py`) and a downstream companion climate-analysis desktop application (`ringclim.py`). The two tools can be used together in one workflow, and each can also be run independently as a standalone application.
+- **Detrend Advisor** standardises tree-ring measurements (RWL): it computes many detrending methods at once with R/dplR, scores them against the goal of the study and exports the chronologies with a report. ITRDB chronologies can be searched and imported directly.
+- **RingClim** (Ring-Climate Analyzer) correlates chronologies with climate: it imports almost any table layout, downloads climate, drought, reanalysis and station data for your sites, screens all monthly or daily windows of the previous and current year and presents the results as tables, heatmaps, spatial correlation maps, moving correlations and reports.
 
-## What this repository is for
-This repository supports practical, reproducible workflows for:
-- dendrochronological detrending advice and method comparison,
-- chronology and RWI-oriented exports,
-- tree-ring to climate correlation analysis,
-- climate-window screening and reporting,
-- validation-oriented workflows, and
-- handoff from Detrend Advisor to RingClim via a prefill manifest.
+One command in Detrend Advisor opens RingClim with all exported chronologies already loaded.
 
-## Software model (important)
-This repository contains **two connected but independently runnable desktop applications**:
+## Download
 
-1. **`detrend_advisor.py`** (primary/upstream): GUI detrending advisor for ring-width-like data (for example TRW / BI), with diagnostics, method comparisons, recommendations, exports, and validation-oriented modes.
-2. **`ringclim.py`** (companion/downstream): GUI tree-ring/climate analysis app for importing chronology/climate/time-series data, running correlation and climate-window analysis, visualizing results, and exporting outputs.
+Ready-to-use packages — nothing to install — are on the **[Releases page](https://github.com/zulfiyor/DeClim/releases/latest)**:
 
-`detrend_advisor.py` can launch RingClim and pass prepared outputs via a **prefill manifest** workflow. However, this repository is **not** a single embedded launcher window; both apps remain standalone runnable desktop programs.
+| System | Package |
+|---|---|
+| Windows 10/11 (64-bit) | `DeClim-Windows-x64.zip` |
+| macOS Intel | `DeClim-macOS-x64.zip` |
 
-## Applications at a glance
+1. Unpack the ZIP into a folder where you can write (Documents, Desktop, your user folder — not *Program Files*).
+2. Start `DeClim/detrend_advisor/detrend_advisor.exe` or `DeClim/ringclim/ringclim.exe` (macOS: `DeClim/detrend_advisor.app`, `DeClim/ringclim.app`).
+3. Detrend Advisor computes with **R** and the R package **dplR** (both free). The program finds R or helps to install it on first use.
 
-### `detrend_advisor.py`
-- Tkinter desktop app with Matplotlib/Tk backend.
-- Imports ring-width-like data from CSV, Tucson-style text, generic text, JSON, and Excel.
-- Optional climate/target CSV input.
-- Supports goals such as `highfreq`, `mixed`, `lowfreq`, `temp_recon`, `runoff_recon`, `drought_recon`, and `variance_check`.
-- Runs detrending advisor workflows (including exponential, spline, RCS, and signal-free RCS contexts), diagnostics, and recommendation logic.
-- Includes GUI usage plus validation/batch-oriented CLI modes.
-- Exports chronology/report outputs and can hand off prepared files to RingClim.
+### Updates
+Both programs check this page once a day (button **Updates** → *Check for updates…*). A new version is downloaded only after you agree, verified with SHA-256 and installed when the program windows are closed; the previous version is kept for *Restore previous version*. Settings, projects and your own files are kept.
+Each published release must include the platform ZIP and its matching `DeClim-update-<platform>.json` file. Keep their generated filenames unchanged.
 
-### `ringclim.py`
-- PySide6 desktop app for chronology/climate correlation workflows.
-- Imports chronology, monthly climate, and time-series style inputs from text/CSV/Excel and related supported formats.
-- Includes import helpers and auto-detection for common layouts and some specialized data formats.
-- Supports climate-window analysis (including daily/hourly and monthly contexts), visualization, export, and report generation.
-- Can run independently, or as downstream continuation after Detrend Advisor export.
+## User guide
+- [DeClim User Guide (PDF)](https://github.com/zulfiyor/DeClim/releases/latest/download/DeClim_User_Guide.pdf) · [Word](https://github.com/zulfiyor/DeClim/releases/latest/download/DeClim_User_Guide.docx)
+- [Worked example data (KYRG002)](https://github.com/zulfiyor/DeClim/releases/latest/download/DeClim_example_KYRG002.zip)
 
-## Connected workflow (Detrend Advisor → RingClim)
-Typical end-to-end use:
-1. Import dendro data in Detrend Advisor.
-2. Choose analysis goal and run detrending/advisory workflows.
-3. Review recommendations, chronologies/RWI outputs, diagnostics, EPS/Rbar context, compare outputs, and runtime logs.
-4. Export chronology/RWI outputs.
-5. Launch RingClim from Detrend Advisor using the prefill-manifest handoff.
-6. Continue with climate-correlation analysis, climate-window scans, plots, and report/export steps in RingClim.
+The current macOS package is built for Intel. Apple Silicon Macs can run it with Rosetta 2.
+The guides are included in every release and in the `docs` folder of the package.
 
-## Standalone use cases
-- **Use only `detrend_advisor.py`** when your main objective is detrending-method evaluation, chronology/RWI preparation, diagnostics, or validation-oriented outputs.
-- **Use only `ringclim.py`** when your main objective is climate-correlation and window-based analysis from already prepared chronology/climate datasets.
-- **Use both together** when you want an integrated detrending-to-climate workflow from raw dendro-style input to climate interpretation.
+## Main features
+- Many detrending methods side by side (negative exponential, splines, age-dependent spline, RCS, Friedman, Hugershoff, AR models …) with automatic scoring and peak diagnostics; STD, RES and ARS chronologies.
+- Custom detrending methods without code: splines, signal-free splines and running means of any period, ranked together with the presets.
+- Direct ITRDB search by map, area or free text (e.g. "Juniper Turkey").
+- Online climate data for chronology locations: CRU TS, TerraClimate, CHELSA, CHIRPS, GPCC, SPEI/SPI, scPDSI, Berkeley Earth, GHCN-Daily stations, ERA5 / ERA5-Land and GloFAS (with your own free Copernicus key) and more; batch download for the whole area.
+- Correlations with all monthly or daily windows of the previous and current year, multi-year periods, ranked tables, heatmaps and reports; parallel and incremental analysis, filters of the results without re-running, automatic session recovery.
+- Spatial (field) correlation maps like the KNMI Climate Explorer, with the site marked, and screening of all variables and windows for the region (effective sample size, shuffle test).
+- Moving (running) correlations with stability statistics and a test of change, and screening of all seasons for the most stable signals.
 
-## Installation and run from source
-
-### Recommended Python version
-- Recommended: **Python 3.11+** (conservative recommendation for current dependency set and desktop workflows).
-
-### 1) Create environment and install runtime dependencies
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### 2) Optional build dependencies
-```bash
-pip install -r requirements-build.txt
-```
-
-### 3) Run Detrend Advisor
-```bash
-python detrend_advisor.py
-```
-
-### 4) Run RingClim
-```bash
-python ringclim.py
-```
-
-### 5) Connected handoff usage
-Run Detrend Advisor first, perform detrending/export, then use its RingClim launch/handoff path to open `ringclim.py` with prefilled data manifest context.
-
-## Runtime dependencies and external tools
-- **Tkinter**: runtime/platform dependency for `detrend_advisor.py` (typically provided by Python distribution; not a PyPI package in this repo).
-- **PySide6 + shiboken6**: Python runtime dependencies for `ringclim.py`.
-- **R / Rscript + dplR**: external runtime dependency for dplR-oriented workflows in `detrend_advisor.py`.
-- Some dependencies are feature-specific; see [docs/RUNTIME_DEPENDENCIES.md](docs/RUNTIME_DEPENDENCIES.md).
-
-## Downloads / Packaged builds (end users)
-Source code and development files are provided in this GitHub repository.
-
-Ready-made packaged desktop builds are provided in this external download folder:
-
-https://drive.google.com/drive/folders/1fQLibCdZHOb9q1mPqpIHZJV1EWFfFGJ3?usp=drive_link
-
-The external download folder contains separate packaged-build directories for:
-- Windows
-- macOS
-
-End-user quick steps:
-1. Open the external download folder.
-2. Choose the Windows or macOS packaged-build directory.
-3. Download the packaged build archive.
-4. Extract it to any convenient location.
-5. Run it directly from that convenient location after extraction.
-
-Important reliability recommendation:
-- It is **very strongly recommended** that R and dplR are already installed on the target computer.
-- Do not assume R/dplR are bundled unless a specific release explicitly verifies and states that.
+## Contact and feedback
+Suggestions, comments and problem reports: **Updates → Contact the developer…** in the programs, e-mail **zb308@cam.ac.uk**, or [GitHub issues](https://github.com/zulfiyor/DeClim/issues).
 
 ## Citation
-This repository is intended to be cited as a connected software suite covering both Detrend Advisor and RingClim.
-
-- See [CITATION.cff](CITATION.cff) for machine-readable metadata.
-- See [CITATION_POLICY.md](CITATION_POLICY.md) for scholarly citation guidance.
-- In-app citation dialogs currently indicate that finalized article text may be added after program paper publication.
-
-If full publication metadata is not yet available, TODO placeholders are used intentionally instead of guessed values.
+Bakhtiyorov, Z. DeClim: Detrend Advisor and RingClim for dendroclimatology (manuscript under review). Please cite this repository until the paper is published.
 
 ## License
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
-
-Note: MIT license terms do not themselves mandate academic citation, but scholarly citation is strongly encouraged for research reuse (see citation policy).
-
-## Limitations
-- Desktop-GUI-first design.
-- Mixed GUI stacks across the suite (Tkinter in Detrend Advisor, PySide6 in RingClim).
-- Some workflows are feature-specific and depend on optional/external runtimes.
-- dplR-oriented detrending/validation workflows depend on external R/Rscript/dplR availability.
-- Format-specific edge cases may require manual import/cleaning.
-- Packaging/runtime behavior can differ by operating system and release artifact.
-
-## Additional documentation
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
-- [docs/DETREND_ADVISOR_OVERVIEW.md](docs/DETREND_ADVISOR_OVERVIEW.md)
-- [docs/RINGCLIM_OVERVIEW.md](docs/RINGCLIM_OVERVIEW.md)
-- [docs/RUNTIME_DEPENDENCIES.md](docs/RUNTIME_DEPENDENCIES.md)
-- [docs/VALIDATION_AND_REPRODUCIBILITY.md](docs/VALIDATION_AND_REPRODUCIBILITY.md)
-- [docs/BUILD_AND_RELEASE_NOTES.md](docs/BUILD_AND_RELEASE_NOTES.md)
+MIT License — see [LICENSE](LICENSE). Developed by Dr. Zulfiyor Bakhtiyorov (University of Cambridge; Xinjiang Institute of Ecology and Geography, CAS; Khujand Scientific Centre, NAS Tajikistan).
